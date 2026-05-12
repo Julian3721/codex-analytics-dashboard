@@ -1,0 +1,28 @@
+.DS_Store
+__pycache__/
+*.py[cod]
+*.log
+*.pid
+*.url
+*.tgz
+
+# Private development context and generated local data.
+AGENTS.md
+PUBLIC_RELEASE_PLAN.md
+.claude/
+.codex/
+codex_analytics_dashboard.html
+codex_analytics_data.json
+codex_usage_dashboard.html
+codex_usage_data.json
+*.jsonl
+*.sqlite
+*.sqlite3
+*.db
+
+# Local app bundle and source assets are not part of the npm package.
+Codex Analytics Dashboard.app/
+CodexUsageDashboard.icns
+CodexUsageDashboard.iconset/
+assets/
+make_app_icon.py

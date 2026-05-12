@@ -1,0 +1,37 @@
+{
+  "name": "codex-analytics-dashboard",
+  "version": "0.1.0",
+  "description": "Local-first analytics dashboard for Codex session logs.",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/Julian3721/codex-analytics-dashboard.git"
+  },
+  "bugs": {
+    "url": "https://github.com/Julian3721/codex-analytics-dashboard/issues"
+  },
+  "homepage": "https://github.com/Julian3721/codex-analytics-dashboard#readme",
+  "bin": {
+    "codex-analytics-dashboard": "bin/codex-analytics-dashboard.js"
+  },
+  "files": [
+    "bin/",
+    "codex_usage_dashboard.py",
+    "README.md",
+    "LICENSE"
+  ],
+  "engines": {
+    "node": ">=18"
+  },
+  "scripts": {
+    "test": "python3 -m unittest && node --check bin/codex-analytics-dashboard.js"
+  },
+  "keywords": [
+    "codex",
+    "analytics",
+    "usage",
+    "dashboard",
+    "tokens",
+    "local-first"
+  ]
+}
