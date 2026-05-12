@@ -6,9 +6,7 @@ __pycache__/
 *.url
 *.tgz
 
-# Private development context and generated local data.
-AGENTS.md
-PUBLIC_RELEASE_PLAN.md
+# Generated local data.
 .claude/
 .codex/
 codex_analytics_dashboard.html
@@ -20,8 +18,8 @@ codex_usage_data.json
 *.sqlite3
 *.db
 
-# Local app bundle and source assets are not part of the npm package.
-Codex Analytics Dashboard.app/
+# Local app bundles and source assets are not part of the npm package.
+*.app/
 CodexUsageDashboard.icns
 CodexUsageDashboard.iconset/
 assets/
