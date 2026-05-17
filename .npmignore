@@ -17,6 +17,11 @@ codex_usage_data.json
 *.sqlite
 *.sqlite3
 *.db
+Codex Analytics/
+CodexAnalytics/
+codex-analytics/
+codex-analytics-snapshots/
+/devices/
 
 # Local app bundles and source assets are not part of the npm package.
 *.app/

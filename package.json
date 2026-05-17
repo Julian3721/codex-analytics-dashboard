@@ -1,6 +1,6 @@
 {
   "name": "codex-analytics-dashboard",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "Local-first analytics dashboard for Codex session logs.",
   "license": "MIT",
   "repository": {
@@ -17,6 +17,7 @@
   "files": [
     "bin/",
     "codex_usage_dashboard.py",
+    "test_launcher_args.js",
     "README.md",
     "LICENSE"
   ],
@@ -24,7 +25,7 @@
     "node": ">=18"
   },
   "scripts": {
-    "test": "python3 -m unittest && node --check bin/codex-analytics-dashboard.js"
+    "test": "python3 -m unittest && node --check bin/codex-analytics-dashboard.js && node test_launcher_args.js"
   },
   "keywords": [
     "codex",

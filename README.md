@@ -52,6 +52,7 @@ python3 codex_usage_dashboard.py --codex-home ~/.codex --serve
 npx codex-analytics-dashboard@latest -- --timezone Europe/Berlin
 npx codex-analytics-dashboard@latest -- --no-open
 npx codex-analytics-dashboard@latest -- --redact
+npx codex-analytics-dashboard@latest -- --snapshot-dir ~/Dropbox --device-name "Work MacBook"
 python3 codex_usage_dashboard.py --out ~/Desktop/codex_analytics_dashboard.html
 python3 codex_usage_dashboard.py --serve --port 8765
 python3 codex_usage_dashboard.py --serve --no-open
@@ -59,6 +60,41 @@ python3 codex_usage_dashboard.py --no-json
 ```
 
 `--redact` also works as `--privacy`. It masks session titles, thread IDs, local paths, and source metadata in the generated dashboard output. Use it when creating screenshots or a shareable local export.
+
+## Multi-Device Snapshots
+
+Do not put your full `~/.codex` directory in Dropbox, iCloud, Syncthing, or any other shared folder. It can contain private prompts, responses, local paths, auth/config files, and raw session logs.
+
+Use a synced parent directory instead. The dashboard creates a `Codex Analytics` folder inside it automatically:
+
+```bash
+npx codex-analytics-dashboard@latest -- --snapshot-dir ~/Dropbox --device-name "Work Windows"
+```
+
+Run the same setup once on each device, pointing all devices at the same synced folder and giving each device a clear name:
+
+```bash
+npx codex-analytics-dashboard@latest -- --snapshot-dir ~/Dropbox --device-name "Personal MacBook"
+```
+
+The snapshot path is saved in the user-local app config, so future dashboard launches update the same folder automatically. Each launch or localhost refresh reads the local `~/.codex`, writes a reduced snapshot for the current device, then aggregates all snapshots found in:
+
+```text
+Dropbox/
+  Codex Analytics/
+    work-windows/
+      device.json
+      snapshot.json
+    personal-macbook/
+      device.json
+      snapshot.json
+```
+
+If you pass a folder already named `Codex Analytics`, `CodexAnalytics`, or `codex-analytics`, that folder is used directly instead of creating another nested folder.
+
+Snapshots include dashboard-level analytics only: token/time series, model usage, cost estimates, message/session counts, and project names. They do not include prompts, responses, tool output, raw rollout logs, SQLite databases, source metadata, full filesystem paths, or auth/config files. Project names are reduced to the final folder name, such as `codex-analytics-dashboard`.
+
+The dashboard defaults to **All devices** and includes a device selector in the header so you can filter the full view down to one device.
 
 ## Outputs
 

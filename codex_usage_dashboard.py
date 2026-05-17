@@ -4,9 +4,12 @@
 from __future__ import annotations
 
 import argparse
+import copy
+import hashlib
 import http.server
 import json
 import os
+import platform
 import re
 import socket
 import socketserver
@@ -14,6 +17,7 @@ import sqlite3
 import subprocess
 import sys
 import urllib.parse
+import uuid
 import webbrowser
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
@@ -42,10 +46,98 @@ MODEL_PRICES = {
 DEFAULT_MODEL = "gpt-5.5"
 ROLLOUT_ID_RE = re.compile(r"rollout-\d{4}-\d{2}-\d{2}T\d{2}-\d{2}-\d{2}-(?P<id>[0-9a-f-]{36})\.jsonl$")
 REDACTED_PATH = "Redacted path"
+SNAPSHOT_SCHEMA_VERSION = 1
+SNAPSHOT_PRIVACY_LEVEL = "projects"
+APP_NAME = "Codex Analytics Dashboard"
+CONFIG_FILE_NAME = "config.json"
 
 
 def default_timezone_name() -> str:
     return os.environ.get("TZ") or "UTC"
+
+
+def app_data_dir() -> Path:
+    override = os.environ.get("CODEX_USAGE_DASHBOARD_DIR")
+    if override:
+        return Path(override).expanduser()
+    if sys.platform == "darwin":
+        return Path.home() / "Library" / "Application Support" / APP_NAME
+    if os.name == "nt":
+        return Path(os.environ.get("LOCALAPPDATA", str(Path.home() / "AppData" / "Local"))) / APP_NAME
+    return Path(os.environ.get("XDG_STATE_HOME", str(Path.home() / ".local" / "state"))) / "codex-analytics-dashboard"
+
+
+def config_path() -> Path:
+    return app_data_dir() / CONFIG_FILE_NAME
+
+
+def load_config() -> dict[str, Any]:
+    path = config_path()
+    if not path.exists():
+        return {}
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return {}
+    return data if isinstance(data, dict) else {}
+
+
+def save_config(config: dict[str, Any]) -> None:
+    path = config_path()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_name(f"{path.name}.tmp-{os.getpid()}")
+    tmp.write_text(json.dumps(config, indent=2, ensure_ascii=False), encoding="utf-8")
+    tmp.replace(path)
+
+
+def default_device_name() -> str:
+    system = platform.system().lower()
+    if system == "darwin":
+        return "macOS device"
+    if system == "windows":
+        return "Windows device"
+    if system == "linux":
+        return "Linux device"
+    return "Codex device"
+
+
+def slugify(value: str, fallback: str = "device") -> str:
+    normalized = re.sub(r"[^a-z0-9]+", "-", value.lower()).strip("-")
+    return normalized or fallback
+
+
+def resolve_snapshot_root(path: Path) -> Path:
+    clean_name = re.sub(r"[\s_-]+", "", path.name.lower())
+    if clean_name in {"codexanalytics"}:
+        return path
+    return path / "Codex Analytics"
+
+
+def resolve_snapshot_setup(args: argparse.Namespace) -> tuple[Path | None, SnapshotDevice | None]:
+    if args.no_snapshot:
+        return None, None
+
+    config = load_config()
+    snapshot_dir_value = args.snapshot_dir or config.get("snapshotDir") or ""
+    if not snapshot_dir_value:
+        return None, None
+    snapshot_root = resolve_snapshot_root(Path(snapshot_dir_value).expanduser())
+
+    device_id = str(config.get("deviceId") or uuid.uuid4())
+    device_name = args.device_name or str(config.get("deviceName") or default_device_name())
+    device_slug = str(config.get("deviceSlug") or slugify(args.device_name or device_name))
+
+    config.update(
+        {
+            "snapshotDir": str(snapshot_root),
+            "deviceId": device_id,
+            "deviceName": device_name,
+            "deviceSlug": device_slug,
+        }
+    )
+    save_config(config)
+
+    return snapshot_root.resolve(), SnapshotDevice(device_id, device_name, device_slug)
 
 
 @dataclass
@@ -166,6 +258,20 @@ class SessionAggregate:
     message_events: MessageEvents = field(default_factory=MessageEvents)
 
 
+@dataclass
+class SnapshotDevice:
+    device_id: str
+    name: str
+    slug: str
+
+    def to_json(self) -> dict[str, str]:
+        return {
+            "id": self.device_id,
+            "name": self.name,
+            "slug": self.slug,
+        }
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Generate a local Codex analytics dashboard.")
     parser.add_argument(
@@ -194,6 +300,24 @@ def parse_args() -> argparse.Namespace:
         dest="redact",
         action="store_true",
         help="Redact session titles, thread IDs, local paths, and source metadata in generated outputs.",
+    )
+    parser.add_argument(
+        "--snapshot-dir",
+        default=os.environ.get("CODEX_ANALYTICS_SNAPSHOT_DIR", ""),
+        help=(
+            "Synced parent directory for privacy-preserving multi-device snapshots. A Codex Analytics "
+            "folder is created inside unless the path is already named Codex Analytics."
+        ),
+    )
+    parser.add_argument(
+        "--device-name",
+        default="",
+        help="Friendly name for this device in synced dashboards. Defaults to a generic OS label.",
+    )
+    parser.add_argument(
+        "--no-snapshot",
+        action="store_true",
+        help="Disable saved snapshot sync for this run, even if a snapshot directory is configured.",
     )
     parser.add_argument(
         "--no-json",
@@ -733,6 +857,325 @@ def redact_payload(payload: dict[str, Any]) -> dict[str, Any]:
                     redact_row(row)
 
     return payload
+
+
+def project_name_from_path(value: Any) -> str:
+    clean = str(value or "").strip().replace("\\", "/").rstrip("/")
+    if not clean or clean == REDACTED_PATH or clean == "No cwd captured":
+        return "No project captured"
+    parts = [part for part in clean.split("/") if part and not re.fullmatch(r"[A-Za-z]:", part)]
+    return parts[-1] if parts else "No project captured"
+
+
+def snapshot_session_id(device_id: str, raw_id: Any) -> str:
+    digest = hashlib.sha256(f"{device_id}:{raw_id or ''}".encode("utf-8")).hexdigest()[:12]
+    return f"session-{digest}"
+
+
+def create_snapshot_payload(payload: dict[str, Any], device: SnapshotDevice) -> dict[str, Any]:
+    snapshot = copy.deepcopy(payload)
+    title_map: dict[str, str] = {}
+
+    def title_for(session_id: str) -> str:
+        if session_id not in title_map:
+            title_map[session_id] = f"Session {len(title_map) + 1}"
+        return title_map[session_id]
+
+    def sanitize_row(row: dict[str, Any]) -> None:
+        session_id = snapshot_session_id(device.device_id, row.get("threadId"))
+        row["threadId"] = session_id
+        row["title"] = title_for(session_id)
+        if "cwd" in row:
+            row["cwd"] = project_name_from_path(row.get("cwd"))
+        row.pop("source", None)
+        row.pop("path", None)
+        row["deviceId"] = device.device_id
+        row["deviceName"] = device.name
+
+    meta = snapshot.setdefault("meta", {})
+    if isinstance(meta, dict):
+        meta["codexHome"] = "redacted"
+        meta["redacted"] = True
+        meta["schemaVersion"] = SNAPSHOT_SCHEMA_VERSION
+        meta["privacyLevel"] = SNAPSHOT_PRIVACY_LEVEL
+        meta["deviceId"] = device.device_id
+        meta["deviceName"] = device.name
+        meta["deviceSlug"] = device.slug
+        meta["devices"] = [device.to_json()]
+
+    for row in snapshot.get("daily", []):
+        if isinstance(row, dict):
+            row["deviceId"] = device.device_id
+            row["deviceName"] = device.name
+    for row in snapshot.get("hourly", []):
+        if isinstance(row, dict):
+            row["deviceId"] = device.device_id
+            row["deviceName"] = device.name
+    for row in snapshot.get("sessions", []):
+        if isinstance(row, dict):
+            sanitize_row(row)
+    for bucket_name in ("dailySessions", "hourlySessions"):
+        buckets = snapshot.get(bucket_name, {})
+        if not isinstance(buckets, dict):
+            continue
+        for rows in buckets.values():
+            if not isinstance(rows, list):
+                continue
+            for row in rows:
+                if isinstance(row, dict):
+                    sanitize_row(row)
+
+    snapshot.pop("devicePayloads", None)
+    return snapshot
+
+
+def device_from_snapshot(payload: dict[str, Any]) -> SnapshotDevice | None:
+    meta = payload.get("meta", {})
+    if not isinstance(meta, dict):
+        return None
+    device_id = str(meta.get("deviceId") or "")
+    device_name = str(meta.get("deviceName") or "")
+    device_slug = str(meta.get("deviceSlug") or slugify(device_name or device_id))
+    if not device_id or not device_name:
+        return None
+    return SnapshotDevice(device_id, device_name, device_slug)
+
+
+def write_json_atomic(path: Path, payload: dict[str, Any]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_name(f"{path.name}.tmp-{os.getpid()}")
+    tmp.write_text(json.dumps(payload, indent=2, ensure_ascii=False), encoding="utf-8")
+    tmp.replace(path)
+
+
+def write_device_snapshot(snapshot_dir: Path, snapshot: dict[str, Any]) -> Path:
+    device = device_from_snapshot(snapshot)
+    if device is None:
+        raise ValueError("snapshot is missing device metadata")
+    meta = snapshot.setdefault("meta", {})
+    if isinstance(meta, dict):
+        meta.setdefault("schemaVersion", SNAPSHOT_SCHEMA_VERSION)
+        meta.setdefault("privacyLevel", SNAPSHOT_PRIVACY_LEVEL)
+        meta.setdefault("redacted", True)
+        meta.setdefault("devices", [device.to_json()])
+    device_dir = snapshot_dir / device.slug
+    write_json_atomic(device_dir / "device.json", device.to_json())
+    write_json_atomic(device_dir / "snapshot.json", snapshot)
+    return device_dir / "snapshot.json"
+
+
+def load_snapshot_payloads(snapshot_dir: Path) -> list[dict[str, Any]]:
+    snapshots: list[dict[str, Any]] = []
+    if not snapshot_dir.exists():
+        return snapshots
+    candidate_paths = list(snapshot_dir.glob("*/snapshot.json"))
+    legacy_devices_dir = snapshot_dir / "devices"
+    if legacy_devices_dir.exists():
+        candidate_paths.extend(legacy_devices_dir.glob("*/snapshot.json"))
+    seen: set[Path] = set()
+    for path in sorted(candidate_paths):
+        resolved = path.resolve()
+        if resolved in seen:
+            continue
+        seen.add(resolved)
+        try:
+            payload = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            continue
+        if not isinstance(payload, dict):
+            continue
+        meta = payload.get("meta", {})
+        if not isinstance(meta, dict):
+            continue
+        if meta.get("schemaVersion") != SNAPSHOT_SCHEMA_VERSION:
+            continue
+        if meta.get("privacyLevel") != SNAPSHOT_PRIVACY_LEVEL:
+            continue
+        if device_from_snapshot(payload) is None:
+            continue
+        snapshots.append(payload)
+    return snapshots
+
+
+def add_usage_json(target: dict[str, int], source: dict[str, Any] | None) -> None:
+    source = source or {}
+    for key in ("input", "cachedInput", "output", "reasoningOutput", "total"):
+        target[key] = int(target.get(key, 0) or 0) + int(source.get(key, 0) or 0)
+
+
+def add_message_events_json(target: dict[str, int], source: dict[str, Any] | None) -> None:
+    source = source or {}
+    for key in ("total", "user", "agent", "primaryAgent", "subagentAgent"):
+        target[key] = int(target.get(key, 0) or 0) + int(source.get(key, 0) or 0)
+
+
+def usage_zero_json() -> dict[str, int]:
+    return {"input": 0, "cachedInput": 0, "output": 0, "reasoningOutput": 0, "total": 0}
+
+
+def message_events_zero_json() -> dict[str, int]:
+    return {"total": 0, "user": 0, "agent": 0, "primaryAgent": 0, "subagentAgent": 0}
+
+
+def add_by_model_json(target: dict[str, dict[str, int]], source: dict[str, Any] | None) -> None:
+    for model, usage in (source or {}).items():
+        target.setdefault(model, usage_zero_json())
+        add_usage_json(target[model], usage)
+
+
+def add_by_model_effort_json(target: dict[str, dict[str, dict[str, int]]], source: dict[str, Any] | None) -> None:
+    for model, efforts in (source or {}).items():
+        model_bucket = target.setdefault(model, {})
+        for effort, usage in (efforts or {}).items():
+            model_bucket.setdefault(effort, usage_zero_json())
+            add_usage_json(model_bucket[effort], usage)
+
+
+def aggregate_snapshot_rows(rows: list[dict[str, Any]], key_name: str) -> list[dict[str, Any]]:
+    buckets: dict[str, dict[str, Any]] = {}
+    for row in rows:
+        key = str(row.get(key_name) or "")
+        if not key:
+            continue
+        bucket = buckets.setdefault(
+            key,
+            {
+                key_name: key,
+                "usage": usage_zero_json(),
+                "byModel": {},
+                "byModelEffort": {},
+                "events": 0,
+                "messageEvents": message_events_zero_json(),
+                "sessionCount": 0,
+            },
+        )
+        add_usage_json(bucket["usage"], row.get("usage"))
+        add_by_model_json(bucket["byModel"], row.get("byModel"))
+        add_by_model_effort_json(bucket["byModelEffort"], row.get("byModelEffort"))
+        add_message_events_json(bucket["messageEvents"], row.get("messageEvents"))
+        bucket["events"] += int(row.get("events", 0) or 0)
+        bucket["sessionCount"] += int(row.get("sessionCount", 0) or 0)
+    return [buckets[key] for key in sorted(buckets)]
+
+
+def combine_session_buckets(snapshots: list[dict[str, Any]], bucket_name: str) -> dict[str, list[dict[str, Any]]]:
+    combined: dict[str, list[dict[str, Any]]] = {}
+    for snapshot in snapshots:
+        buckets = snapshot.get(bucket_name, {})
+        if not isinstance(buckets, dict):
+            continue
+        for key, rows in buckets.items():
+            if isinstance(rows, list):
+                combined.setdefault(key, []).extend(copy.deepcopy([row for row in rows if isinstance(row, dict)]))
+    for rows in combined.values():
+        rows.sort(key=lambda item: item.get("usage", {}).get("total", 0), reverse=True)
+    return dict(sorted(combined.items()))
+
+
+def combine_snapshot_payloads(snapshots: list[dict[str, Any]], tz_name: str) -> dict[str, Any]:
+    valid_snapshots = [snapshot for snapshot in snapshots if device_from_snapshot(snapshot) is not None]
+    if not valid_snapshots:
+        return build_empty_payload(tz_name)
+
+    devices = [device_from_snapshot(snapshot) for snapshot in valid_snapshots]
+    devices_json = [device.to_json() for device in devices if device is not None]
+    first = valid_snapshots[0]
+    pricing = copy.deepcopy(first.get("pricing", {"defaultModel": DEFAULT_MODEL, "models": MODEL_PRICES}))
+    price_sources = copy.deepcopy(first.get("meta", {}).get("priceSources", []))
+
+    totals_usage = usage_zero_json()
+    totals_by_model: dict[str, dict[str, int]] = {}
+    totals_by_model_effort: dict[str, dict[str, dict[str, int]]] = {}
+    all_sessions: list[dict[str, Any]] = []
+    all_daily_rows: list[dict[str, Any]] = []
+    all_hourly_rows: list[dict[str, Any]] = []
+    session_files = 0
+    sessions_with_usage = 0
+
+    for snapshot in valid_snapshots:
+        totals = snapshot.get("totals", {})
+        add_usage_json(totals_usage, totals.get("usage"))
+        add_by_model_json(totals_by_model, totals.get("byModel"))
+        add_by_model_effort_json(totals_by_model_effort, totals.get("byModelEffort"))
+        all_sessions.extend(copy.deepcopy([row for row in snapshot.get("sessions", []) if isinstance(row, dict)]))
+        all_daily_rows.extend(copy.deepcopy([row for row in snapshot.get("daily", []) if isinstance(row, dict)]))
+        all_hourly_rows.extend(copy.deepcopy([row for row in snapshot.get("hourly", []) if isinstance(row, dict)]))
+        meta = snapshot.get("meta", {})
+        if isinstance(meta, dict):
+            session_files += int(meta.get("sessionFiles", 0) or 0)
+            sessions_with_usage += int(meta.get("sessionsWithUsage", 0) or 0)
+
+    all_sessions.sort(key=lambda item: item.get("usage", {}).get("total", 0), reverse=True)
+    default_model = pricing.get("defaultModel", DEFAULT_MODEL)
+    models = pricing.get("models", MODEL_PRICES)
+    cost_logged_mix = 0.0
+    for model, usage in totals_by_model.items():
+        rate = models.get(model) or models.get(default_model) or MODEL_PRICES.get(DEFAULT_MODEL, {})
+        cached = min(int(usage.get("cachedInput", 0) or 0), int(usage.get("input", 0) or 0))
+        uncached = max(0, int(usage.get("input", 0) or 0) - cached)
+        cost_logged_mix += (
+            uncached * float(rate.get("input", 0))
+            + cached * float(rate.get("cached_input", 0))
+            + int(usage.get("output", 0) or 0) * float(rate.get("output", 0))
+        ) / 1_000_000
+
+    generated_at = datetime.now(ZoneInfo(tz_name)).isoformat(timespec="seconds")
+    return {
+        "meta": {
+            "generatedAt": generated_at,
+            "timezone": tz_name,
+            "codexHome": "synced snapshots",
+            "sessionFiles": session_files,
+            "sessionsWithUsage": sessions_with_usage,
+            "priceSources": price_sources,
+            "redacted": True,
+            "schemaVersion": SNAPSHOT_SCHEMA_VERSION,
+            "privacyLevel": SNAPSHOT_PRIVACY_LEVEL,
+            "devices": devices_json,
+        },
+        "pricing": pricing,
+        "totals": {
+            "usage": totals_usage,
+            "byModel": dict(sorted(totals_by_model.items())),
+            "byModelEffort": dict(sorted(totals_by_model_effort.items())),
+            "costLoggedMix": cost_logged_mix,
+        },
+        "hourly": aggregate_snapshot_rows(all_hourly_rows, "hour"),
+        "daily": aggregate_snapshot_rows(all_daily_rows, "date"),
+        "dailySessions": combine_session_buckets(valid_snapshots, "dailySessions"),
+        "hourlySessions": combine_session_buckets(valid_snapshots, "hourlySessions"),
+        "sessions": all_sessions,
+        "devicePayloads": {
+            str(snapshot["meta"]["deviceId"]): copy.deepcopy(snapshot)
+            for snapshot in valid_snapshots
+            if isinstance(snapshot.get("meta"), dict)
+        },
+    }
+
+
+def build_empty_payload(tz_name: str) -> dict[str, Any]:
+    return {
+        "meta": {
+            "generatedAt": datetime.now(ZoneInfo(tz_name)).isoformat(timespec="seconds"),
+            "timezone": tz_name,
+            "codexHome": "synced snapshots",
+            "sessionFiles": 0,
+            "sessionsWithUsage": 0,
+            "priceSources": [],
+            "redacted": True,
+            "schemaVersion": SNAPSHOT_SCHEMA_VERSION,
+            "privacyLevel": SNAPSHOT_PRIVACY_LEVEL,
+            "devices": [],
+        },
+        "pricing": {"defaultModel": DEFAULT_MODEL, "models": MODEL_PRICES},
+        "totals": {"usage": usage_zero_json(), "byModel": {}, "byModelEffort": {}, "costLoggedMix": 0},
+        "hourly": [],
+        "daily": [],
+        "dailySessions": {},
+        "hourlySessions": {},
+        "sessions": [],
+        "devicePayloads": {},
+    }
 
 
 def build_payload(codex_home: Path, tz_name: str) -> dict[str, Any]:
@@ -1884,6 +2327,10 @@ HTML_TEMPLATE = r"""<!doctype html>
       </div>
       <div class="toolbar">
         <div class="control">
+          <label for="deviceSelect">Device</label>
+          <select id="deviceSelect"></select>
+        </div>
+        <div class="control">
           <label for="rangeSelect">Range</label>
           <select id="rangeSelect">
             <option value="30">Last 30 days</option>
@@ -2056,8 +2503,10 @@ HTML_TEMPLATE = r"""<!doctype html>
   </div>
 
   <script>
-    const DATA = __DATA_JSON__;
+    const ROOT_DATA = __DATA_JSON__;
+    let DATA = ROOT_DATA;
     const state = {
+      device: "all",
       range: "30",
       price: "logged",
       chartMode: "total",
@@ -2075,9 +2524,9 @@ HTML_TEMPLATE = r"""<!doctype html>
       selectedDate: null
     };
 
-    const byDate = new Map(DATA.daily.map(day => [day.date, day]));
-    const byHour = new Map((DATA.hourly || []).map(hour => [hour.hour, hour]));
-    const allDates = DATA.daily.map(day => day.date);
+    let byDate = new Map();
+    let byHour = new Map();
+    let allDates = [];
     const expandedModelRows = new Set();
     const HEATMAP_TOKEN_FULL_SCALE = 250_000_000;
     const HEATMAP_TOKEN_METRICS = new Set(["total", "input", "totalInput", "output"]);
@@ -2087,6 +2536,12 @@ HTML_TEMPLATE = r"""<!doctype html>
       [1.00, [185, 133, 37]],
     ];
     let heatmapPanDrag = null;
+
+    function refreshDataIndexes() {
+      byDate = new Map((DATA.daily || []).map(day => [day.date, day]));
+      byHour = new Map((DATA.hourly || []).map(hour => [hour.hour, hour]));
+      allDates = (DATA.daily || []).map(day => day.date);
+    }
 
     function usageZero() {
       return { input: 0, cachedInput: 0, output: 0, reasoningOutput: 0, total: 0 };
@@ -2985,6 +3440,33 @@ HTML_TEMPLATE = r"""<!doctype html>
       select.value = state.price;
     }
 
+    function availableDevices() {
+      return Array.isArray(ROOT_DATA.meta?.devices) ? ROOT_DATA.meta.devices : [];
+    }
+
+    function renderDeviceOptions() {
+      const select = document.getElementById("deviceSelect");
+      if (!select) return;
+      const devices = availableDevices();
+      const options = devices.length
+        ? [["all", "All devices"], ...devices.map(device => [device.id, device.name || device.slug || "Device"])]
+        : [["all", "Local device"]];
+      select.innerHTML = options.map(([value, label]) => `<option value="${escapeHtml(value)}">${escapeHtml(label)}</option>`).join("");
+      select.value = options.some(([value]) => value === state.device) ? state.device : "all";
+    }
+
+    function setActiveDevice(deviceId) {
+      state.device = deviceId || "all";
+      DATA = state.device === "all" ? ROOT_DATA : (ROOT_DATA.devicePayloads?.[state.device] || ROOT_DATA);
+      refreshDataIndexes();
+      state.selectedChartKey = null;
+      state.selectedDate = null;
+      renderPriceOptions();
+      renderDeviceOptions();
+      selectVisibleBucket();
+      renderAll();
+    }
+
     function renderStats() {
       const days = filteredDays();
       const agg = aggregate(days);
@@ -3720,7 +4202,7 @@ HTML_TEMPLATE = r"""<!doctype html>
               <tr>
                 <td>
                   <div class="session-title">${escapeHtml(row.title)}</div>
-                  <div class="session-sub">${escapeHtml(row.model)} · ${escapeHtml(row.cwd || "No cwd captured")}</div>
+                  <div class="session-sub">${escapeHtml([row.model, row.cwd || "No cwd captured", row.deviceName].filter(Boolean).join(" · "))}</div>
                 </td>
                 <td>${compact(row.usage.total)}</td>
                 <td>${compact(uncachedInput(row.usage))}</td>
@@ -3795,6 +4277,7 @@ HTML_TEMPLATE = r"""<!doctype html>
               <span>${compact(item.usage.total)} Tokens</span>
               <span>${money(costForByModel(item.byModel, item.usage))}</span>
               <span>${escapeHtml(item.model)}</span>
+              ${item.deviceName ? `<span>${escapeHtml(item.deviceName)}</span>` : ""}
             </div>
             <div class="progress" title="Total Input Tokens and Output Tokens split">
               <div class="input" style="width:${inputShare}%"></div>
@@ -4009,6 +4492,9 @@ HTML_TEMPLATE = r"""<!doctype html>
       state.range = event.target.value;
       renderAll();
     });
+    document.getElementById("deviceSelect").addEventListener("change", event => {
+      setActiveDevice(event.target.value);
+    });
     document.getElementById("heatMetric").addEventListener("change", event => {
       state.heatMetric = event.target.value;
       renderAll();
@@ -4109,7 +4595,9 @@ HTML_TEMPLATE = r"""<!doctype html>
       });
     });
 
+    refreshDataIndexes();
     renderPriceOptions();
+    renderDeviceOptions();
     renderAll();
   </script>
 </body>
@@ -4123,6 +4611,24 @@ def write_outputs(payload: dict[str, Any], out: Path, json_out: Path | None) -> 
     out.write_text(html, encoding="utf-8")
     if json_out:
         json_out.write_text(json.dumps(payload, indent=2, ensure_ascii=False), encoding="utf-8")
+
+
+def build_dashboard_payload(
+    codex_home: Path,
+    timezone_name: str,
+    redact: bool = False,
+    snapshot_dir: Path | None = None,
+    device: SnapshotDevice | None = None,
+) -> dict[str, Any]:
+    raw_payload = build_payload(codex_home, timezone_name)
+    if snapshot_dir and device:
+        current_snapshot = create_snapshot_payload(raw_payload, device)
+        write_device_snapshot(snapshot_dir, current_snapshot)
+        snapshots = load_snapshot_payloads(snapshot_dir)
+        return combine_snapshot_payloads(snapshots, timezone_name)
+    if redact:
+        redact_payload(raw_payload)
+    return raw_payload
 
 
 def resolve_generator_source(value: str) -> Path | None:
@@ -4143,6 +4649,9 @@ def generate_with_current_source(
     out: Path,
     json_out: Path | None,
     redact: bool = False,
+    snapshot_dir: Path | None = None,
+    device_name: str = "",
+    no_snapshot: bool = False,
 ) -> dict[str, Any]:
     command = [
         sys.executable,
@@ -4162,6 +4671,12 @@ def generate_with_current_source(
         command.append("--no-json")
     if redact:
         command.append("--redact")
+    if snapshot_dir:
+        command.extend(["--snapshot-dir", str(snapshot_dir)])
+    if device_name:
+        command.extend(["--device-name", device_name])
+    if no_snapshot:
+        command.append("--no-snapshot")
 
     result = subprocess.run(command, capture_output=True, text=True, check=False)
     if result.returncode != 0:
@@ -4171,10 +4686,9 @@ def generate_with_current_source(
     if json_out and json_out.exists():
         return json.loads(json_out.read_text(encoding="utf-8"))
 
-    payload = build_payload(codex_home, timezone_name)
-    if redact:
-        redact_payload(payload)
-    return payload
+    snapshot_setup = None if no_snapshot else resolve_snapshot_setup(argparse.Namespace(snapshot_dir=str(snapshot_dir or ""), device_name=device_name, no_snapshot=no_snapshot))
+    local_snapshot_dir, local_device = snapshot_setup if snapshot_setup else (None, None)
+    return build_dashboard_payload(codex_home, timezone_name, redact, local_snapshot_dir, local_device)
 
 
 def find_available_port(start_port: int) -> int:
@@ -4278,13 +4792,22 @@ def main() -> None:
     json_out = None if args.no_json else Path(args.json_out).expanduser().resolve()
     url_file = Path(args.server_url_file).expanduser().resolve() if args.server_url_file else None
     generator_source = resolve_generator_source(args.generator_source)
+    snapshot_dir, snapshot_device = resolve_snapshot_setup(args)
 
     def refresh_outputs() -> dict[str, Any]:
         if args.serve and generator_source:
-            return generate_with_current_source(generator_source, codex_home, args.timezone, out, json_out, args.redact)
-        refreshed_payload = build_payload(codex_home, args.timezone)
-        if args.redact:
-            redact_payload(refreshed_payload)
+            return generate_with_current_source(
+                generator_source,
+                codex_home,
+                args.timezone,
+                out,
+                json_out,
+                args.redact,
+                snapshot_dir,
+                args.device_name,
+                args.no_snapshot,
+            )
+        refreshed_payload = build_dashboard_payload(codex_home, args.timezone, args.redact, snapshot_dir, snapshot_device)
         write_outputs(refreshed_payload, out, json_out)
         return refreshed_payload
 
