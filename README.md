@@ -18,6 +18,25 @@ npx codex-analytics-dashboard@latest
 
 The `npx` launcher starts a localhost dashboard server, opens the dashboard in your browser, and writes generated files to a user-local application data directory. Browser refresh regenerates the dashboard from the latest local logs while the server is running.
 
+## Updating
+
+If you use `npx codex-analytics-dashboard@latest`, updating is just running the same command again:
+
+```bash
+npx codex-analytics-dashboard@latest
+```
+
+The saved snapshot configuration is not overwritten. The dashboard keeps using the same user-local app config and the same synced `Codex Analytics` folder, then refreshes this device's `snapshot.json` on launch or browser refresh.
+
+If you installed the command globally, update the global package first:
+
+```bash
+npm install -g codex-analytics-dashboard@latest
+codex-analytics-dashboard
+```
+
+You only need to pass `--snapshot-dir` and `--device-name` again when setting up a new device, changing the synced folder, or renaming the device.
+
 Install it globally if you prefer a reusable command:
 
 ```bash
