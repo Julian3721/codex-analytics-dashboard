@@ -66,12 +66,12 @@ class PublicReleaseTests(unittest.TestCase):
         self.assertEqual(payload["dailySessions"]["2026-05-12"][0]["title"], "Session 1")
         self.assertEqual(payload["dailySessions"]["2026-05-12"][0]["cwd"], "Redacted path")
 
-    def test_snapshot_payload_keeps_project_names_without_private_fields(self) -> None:
+    def test_snapshot_payload_keeps_project_and_session_names_without_private_fields(self) -> None:
         payload = {
             "meta": {
                 "generatedAt": "2026-05-17T12:00:00+02:00",
                 "timezone": "Europe/Berlin",
-                "codexHome": r"C:\Users\ExampleUser\.codex",
+                "codexHome": r"X:\SourceLogs\.codex",
                 "sessionFiles": 1,
                 "sessionsWithUsage": 1,
                 "priceSources": [],
@@ -83,10 +83,10 @@ class PublicReleaseTests(unittest.TestCase):
             "sessions": [
                 {
                     "threadId": "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa",
-                    "title": "Private prompt about a secret repo",
-                    "cwd": r"C:\Users\ExampleUser\Private\Client Project\codex-analytics-dashboard",
+                    "title": "Implement dashboard sync feature",
+                    "cwd": r"X:\SourceLogs\Client Matter\codex-analytics-dashboard",
                     "source": '{"private": "value"}',
-                    "path": r"C:\Users\ExampleUser\.codex\sessions\rollout-private.jsonl",
+                    "path": r"X:\SourceLogs\.codex\sessions\rollout-local.jsonl",
                     "model": "gpt-5.5",
                     "usage": {"input": 100, "cachedInput": 10, "output": 23, "reasoningOutput": 3, "total": 123},
                     "byModel": {"gpt-5.5": {"input": 100, "cachedInput": 10, "output": 23, "reasoningOutput": 3, "total": 123}},
@@ -97,8 +97,8 @@ class PublicReleaseTests(unittest.TestCase):
                 "2026-05-17": [
                     {
                         "threadId": "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa",
-                        "title": "Private prompt about a secret repo",
-                        "cwd": r"C:\Users\ExampleUser\Private\Client Project\codex-analytics-dashboard",
+                        "title": "Implement dashboard sync feature",
+                        "cwd": r"X:\SourceLogs\Client Matter\codex-analytics-dashboard",
                         "model": "gpt-5.5",
                         "usage": {"input": 100, "cachedInput": 10, "output": 23, "reasoningOutput": 3, "total": 123},
                         "byModel": {"gpt-5.5": {"input": 100, "cachedInput": 10, "output": 23, "reasoningOutput": 3, "total": 123}},
@@ -121,13 +121,12 @@ class PublicReleaseTests(unittest.TestCase):
         self.assertEqual(snapshot["meta"]["privacyLevel"], "projects")
         self.assertEqual(snapshot["meta"]["deviceName"], "Work Windows")
         self.assertEqual(snapshot["sessions"][0]["cwd"], "codex-analytics-dashboard")
-        self.assertEqual(snapshot["sessions"][0]["title"], "Session 1")
-        self.assertNotIn(r"C:\Users", encoded)
-        self.assertNotIn("ExampleUser", encoded)
-        self.assertNotIn("Private", encoded)
-        self.assertNotIn("Private prompt", encoded)
+        self.assertEqual(snapshot["sessions"][0]["title"], "Implement dashboard sync feature")
+        self.assertEqual(snapshot["dailySessions"]["2026-05-17"][0]["title"], "Implement dashboard sync feature")
+        self.assertNotIn(r"X:\SourceLogs", encoded)
+        self.assertNotIn("Client Matter", encoded)
         self.assertNotIn("aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa", encoded)
-        self.assertNotIn("rollout-private.jsonl", encoded)
+        self.assertNotIn("rollout-local.jsonl", encoded)
         self.assertNotIn('"private": "value"', encoded)
 
     def test_snapshot_folder_combines_device_subdirectories(self) -> None:

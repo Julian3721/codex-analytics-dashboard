@@ -874,17 +874,11 @@ def snapshot_session_id(device_id: str, raw_id: Any) -> str:
 
 def create_snapshot_payload(payload: dict[str, Any], device: SnapshotDevice) -> dict[str, Any]:
     snapshot = copy.deepcopy(payload)
-    title_map: dict[str, str] = {}
-
-    def title_for(session_id: str) -> str:
-        if session_id not in title_map:
-            title_map[session_id] = f"Session {len(title_map) + 1}"
-        return title_map[session_id]
 
     def sanitize_row(row: dict[str, Any]) -> None:
         session_id = snapshot_session_id(device.device_id, row.get("threadId"))
         row["threadId"] = session_id
-        row["title"] = title_for(session_id)
+        row["title"] = str(row.get("title") or "Untitled Codex session")
         if "cwd" in row:
             row["cwd"] = project_name_from_path(row.get("cwd"))
         row.pop("source", None)

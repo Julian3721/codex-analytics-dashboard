@@ -92,7 +92,7 @@ Dropbox/
 
 If you pass a folder already named `Codex Analytics`, `CodexAnalytics`, or `codex-analytics`, that folder is used directly instead of creating another nested folder.
 
-Snapshots include dashboard-level analytics only: token/time series, model usage, cost estimates, message/session counts, and project names. They do not include prompts, responses, tool output, raw rollout logs, SQLite databases, source metadata, full filesystem paths, or auth/config files. Project names are reduced to the final folder name, such as `codex-analytics-dashboard`.
+Snapshots include dashboard-level analytics only: token/time series, model usage, cost estimates, message/session counts, session titles, and project names. They do not include prompts, responses, tool output, raw rollout logs, SQLite databases, source metadata, full filesystem paths, or auth/config files. Project names are reduced to the final folder name, such as `codex-analytics-dashboard`.
 
 The dashboard defaults to **All devices** and includes a device selector in the header so you can filter the full view down to one device.
 
