@@ -1,6 +1,6 @@
 {
   "name": "codex-analytics-dashboard",
-  "version": "0.2.3",
+  "version": "0.2.4",
   "description": "Local-first analytics dashboard for Codex session logs.",
   "license": "MIT",
   "repository": {

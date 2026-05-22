@@ -194,7 +194,7 @@ class PublicReleaseTests(unittest.TestCase):
                             ],
                         }
                     ),
-                    encoding="utf-8",
+                    encoding="utf-8-sig",
                 )
 
                 aliases = dashboard.file_project_aliases()
@@ -355,12 +355,14 @@ class PublicReleaseTests(unittest.TestCase):
         self.assertIn("HEATMAP_COLOR_STEPS = 7", dashboard.HTML_TEMPLATE)
         self.assertIn("HEATMAP_SCALE_STEPS", dashboard.HTML_TEMPLATE)
         self.assertIn("progress-fill", dashboard.HTML_TEMPLATE)
-        self.assertIn("% of top session, split", dashboard.HTML_TEMPLATE)
+        self.assertIn("% of top session by Total Tokens", dashboard.HTML_TEMPLATE)
 
     def test_dashboard_template_has_project_identity_and_compact_selected_summary(self) -> None:
         self.assertIn("normalizeProjectKey", dashboard.HTML_TEMPLATE)
         self.assertIn("selected-summary", dashboard.HTML_TEMPLATE)
         self.assertIn("selectedSummaryToggle", dashboard.HTML_TEMPLATE)
+        self.assertIn("header-lower", dashboard.HTML_TEMPLATE)
+        self.assertIn("Codex activity analytics", dashboard.HTML_TEMPLATE)
         self.assertIn("Generated ${new Date(DATA.meta.generatedAt).toLocaleString()} with Codex Analytics Dashboard", dashboard.HTML_TEMPLATE)
 
     def test_npm_package_uses_analytics_dashboard_name(self) -> None:

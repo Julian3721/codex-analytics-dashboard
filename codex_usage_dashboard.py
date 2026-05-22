@@ -43,7 +43,7 @@ MODEL_PRICES = {
     "gpt-5": {"input": 1.25, "cached_input": 0.125, "output": 10.00},
 }
 
-APP_VERSION = "0.2.3"
+APP_VERSION = "0.2.4"
 DEFAULT_MODEL = "gpt-5.5"
 ROLLOUT_ID_RE = re.compile(r"rollout-\d{4}-\d{2}-\d{2}T\d{2}-\d{2}-\d{2}-(?P<id>[0-9a-f-]{36})\.jsonl$")
 REDACTED_PATH = "Redacted path"
@@ -116,7 +116,7 @@ def load_config() -> dict[str, Any]:
     if not path.exists():
         return {}
     try:
-        data = json.loads(path.read_text(encoding="utf-8"))
+        data = json.loads(path.read_text(encoding="utf-8-sig"))
     except (OSError, json.JSONDecodeError):
         return {}
     return data if isinstance(data, dict) else {}
@@ -169,7 +169,7 @@ def config_project_aliases(config: dict[str, Any]) -> dict[str, str]:
 def file_project_aliases() -> dict[str, str]:
     path = ensure_project_aliases_file()
     try:
-        data = json.loads(path.read_text(encoding="utf-8"))
+        data = json.loads(path.read_text(encoding="utf-8-sig"))
     except (OSError, json.JSONDecodeError):
         return {}
     resolved: dict[str, str] = {}
@@ -195,7 +195,7 @@ def file_project_aliases() -> dict[str, str]:
 def save_project_alias_file_entry(source: str, target: str) -> None:
     path = ensure_project_aliases_file()
     try:
-        data = json.loads(path.read_text(encoding="utf-8"))
+        data = json.loads(path.read_text(encoding="utf-8-sig"))
     except (OSError, json.JSONDecodeError):
         data = default_project_aliases_document()
     projects = data.setdefault("projects", [])
@@ -1617,10 +1617,14 @@ HTML_TEMPLATE = r"""<!doctype html>
     }
     header {
       display: grid;
-      grid-template-columns: minmax(420px, 1fr) auto;
-      gap: 24px;
-      align-items: end;
+      gap: 12px;
       margin-bottom: 18px;
+    }
+    .header-lower {
+      display: flex;
+      gap: 16px;
+      align-items: end;
+      justify-content: space-between;
     }
     h1 {
       margin: 0;
@@ -1641,17 +1645,18 @@ HTML_TEMPLATE = r"""<!doctype html>
       letter-spacing: 0;
     }
     .subtitle {
-      margin: 10px 0 0;
+      margin: 0;
       color: var(--muted);
-      max-width: 760px;
+      max-width: 560px;
       line-height: 1.45;
     }
     .toolbar {
       display: flex;
-      flex-wrap: wrap;
-      gap: 10px;
+      flex-wrap: nowrap;
+      gap: 8px;
       justify-content: flex-end;
       align-items: center;
+      white-space: nowrap;
     }
     .control {
       display: flex;
@@ -1674,6 +1679,10 @@ HTML_TEMPLATE = r"""<!doctype html>
       background: transparent;
       min-width: 110px;
       outline: none;
+    }
+    #timezoneSelect {
+      min-width: 118px;
+      max-width: 150px;
     }
     input[type="date"] {
       border: 0;
@@ -2013,7 +2022,7 @@ HTML_TEMPLATE = r"""<!doctype html>
     }
     .selected-summary {
       display: grid;
-      grid-template-columns: repeat(3, minmax(0, 1fr));
+      grid-template-columns: repeat(4, minmax(0, 1fr));
       gap: 10px;
       margin-top: 12px;
     }
@@ -2021,18 +2030,18 @@ HTML_TEMPLATE = r"""<!doctype html>
       display: none;
     }
     .selected-summary-toggle {
-      border: 1px solid var(--line);
-      border-radius: 8px;
-      background: var(--panel);
-      color: var(--ink);
+      border: 0;
+      background: transparent;
+      color: var(--muted);
       cursor: pointer;
-      font-weight: 750;
-      margin-top: 10px;
-      min-height: 36px;
-      padding: 7px 10px;
+      font-size: 12px;
+      font-weight: 700;
+      margin-top: 8px;
+      min-height: 26px;
+      padding: 4px 2px;
     }
     .selected-summary-toggle:hover {
-      background: var(--panel-soft);
+      color: var(--ink);
     }
     .mini {
       position: relative;
@@ -2354,12 +2363,12 @@ HTML_TEMPLATE = r"""<!doctype html>
       min-width: 1180px;
     }
     #sessionTable table {
-      min-width: 960px;
+      min-width: 900px;
     }
     #sessionTable th:first-child,
     #sessionTable td:first-child {
-      min-width: 420px;
-      width: 420px;
+      min-width: 260px;
+      width: 260px;
     }
     .model-toggle {
       border: 0;
@@ -2511,6 +2520,9 @@ HTML_TEMPLATE = r"""<!doctype html>
     }
     .top-sessions-panel .top-item h3 {
       font-size: 13px;
+      overflow: hidden;
+      text-overflow: ellipsis;
+      white-space: nowrap;
     }
     .top-meta {
       display: flex;
@@ -2534,6 +2546,8 @@ HTML_TEMPLATE = r"""<!doctype html>
     .progress-fill {
       display: flex;
       height: 100%;
+      border-radius: 99px;
+      background: var(--input);
     }
     .progress .input { background: var(--input); }
     .progress .output { background: var(--output); }
@@ -2642,8 +2656,11 @@ HTML_TEMPLATE = r"""<!doctype html>
         grid-template-columns: 1fr;
       }
       .details { height: auto !important; }
-      header { grid-template-columns: 1fr; }
       h1 { font-size: 34px; }
+      .header-lower {
+        align-items: flex-start;
+        flex-direction: column;
+      }
       .toolbar { justify-content: flex-start; }
     }
     @media (max-width: 720px) {
@@ -2693,30 +2710,32 @@ HTML_TEMPLATE = r"""<!doctype html>
 <body>
   <div class="shell">
     <header>
-      <div>
+      <div class="header-title">
         <h1>Codex Analytics Dashboard</h1>
-        <p class="subtitle">Daily token momentum from local Codex logs. Cost is a what-if API estimate, not your subscription billing.</p>
       </div>
-      <div class="toolbar">
-        <div class="control">
-          <label for="deviceSelect">Device</label>
-          <select id="deviceSelect"></select>
-        </div>
-        <div class="control">
-          <label for="timezoneSelect">Timezone</label>
-          <select id="timezoneSelect"></select>
-        </div>
-        <div class="control">
-          <label for="rangeSelect">Range</label>
-          <select id="rangeSelect">
-            <option value="30">Last 30 days</option>
-            <option value="90">Last 90 days</option>
-            <option value="all">All time</option>
-          </select>
-        </div>
-        <div class="control">
-          <label for="priceSelect">Cost basis</label>
-          <select id="priceSelect"></select>
+      <div class="header-lower">
+        <p class="subtitle">Codex activity analytics for tokens, sessions, projects, models, and usage trends across your devices.</p>
+        <div class="toolbar">
+          <div class="control">
+            <label for="deviceSelect">Device</label>
+            <select id="deviceSelect"></select>
+          </div>
+          <div class="control">
+            <label for="timezoneSelect">Timezone</label>
+            <select id="timezoneSelect"></select>
+          </div>
+          <div class="control">
+            <label for="rangeSelect">Range</label>
+            <select id="rangeSelect">
+              <option value="30">Last 30 days</option>
+              <option value="90">Last 90 days</option>
+              <option value="all">All time</option>
+            </select>
+          </div>
+          <div class="control">
+            <label for="priceSelect">Cost basis</label>
+            <select id="priceSelect"></select>
+          </div>
         </div>
       </div>
     </header>
@@ -2915,33 +2934,32 @@ HTML_TEMPLATE = r"""<!doctype html>
       [1.00, [185, 133, 37]],
     ];
     const TIMEZONE_OPTIONS = [
-      ["Pacific/Pago_Pago", "UTC-11 - Pago Pago"],
-      ["Pacific/Honolulu", "UTC-10 - Honolulu"],
-      ["America/Anchorage", "UTC-09 - Anchorage"],
-      ["America/Los_Angeles", "UTC-08 - Los Angeles"],
-      ["America/Denver", "UTC-07 - Denver"],
-      ["America/Chicago", "UTC-06 - Chicago"],
-      ["America/New_York", "UTC-05 - New York"],
-      ["America/Halifax", "UTC-04 - Halifax"],
-      ["America/Sao_Paulo", "UTC-03 - Sao Paulo"],
-      ["Atlantic/South_Georgia", "UTC-02 - South Georgia"],
-      ["Atlantic/Azores", "UTC-01 - Azores"],
-      ["UTC", "UTC - Coordinated Universal Time"],
-      ["Europe/London", "UTC+00 - London"],
-      ["Europe/Berlin", "UTC+01 - Berlin"],
-      ["Europe/Athens", "UTC+02 - Athens"],
-      ["Europe/Moscow", "UTC+03 - Moscow"],
-      ["Asia/Dubai", "UTC+04 - Dubai"],
-      ["Asia/Karachi", "UTC+05 - Karachi"],
-      ["Asia/Dhaka", "UTC+06 - Dhaka"],
-      ["Asia/Bangkok", "UTC+07 - Bangkok"],
-      ["Asia/Shanghai", "UTC+08 - Shanghai"],
-      ["Asia/Tokyo", "UTC+09 - Tokyo"],
-      ["Australia/Sydney", "UTC+10 - Sydney"],
-      ["Pacific/Noumea", "UTC+11 - Noumea"],
-      ["Pacific/Auckland", "UTC+12 - Auckland"],
-      ["Pacific/Apia", "UTC+13 - Apia"],
-      ["Pacific/Kiritimati", "UTC+14 - Kiritimati"],
+      ["Pacific/Pago_Pago", "UTC-11 Pago Pago"],
+      ["Pacific/Honolulu", "UTC-10 Honolulu"],
+      ["America/Anchorage", "UTC-09 Anchorage"],
+      ["America/Los_Angeles", "UTC-08 Los Angeles"],
+      ["America/Denver", "UTC-07 Denver"],
+      ["America/Chicago", "UTC-06 Chicago"],
+      ["America/New_York", "UTC-05 New York"],
+      ["America/Halifax", "UTC-04 Halifax"],
+      ["America/Sao_Paulo", "UTC-03 Sao Paulo"],
+      ["Atlantic/South_Georgia", "UTC-02 South Georgia"],
+      ["Atlantic/Azores", "UTC-01 Azores"],
+      ["Europe/London", "UTC+00 London"],
+      ["Europe/Berlin", "UTC+01 Berlin"],
+      ["Europe/Athens", "UTC+02 Athens"],
+      ["Europe/Moscow", "UTC+03 Moscow"],
+      ["Asia/Dubai", "UTC+04 Dubai"],
+      ["Asia/Karachi", "UTC+05 Karachi"],
+      ["Asia/Dhaka", "UTC+06 Dhaka"],
+      ["Asia/Bangkok", "UTC+07 Bangkok"],
+      ["Asia/Shanghai", "UTC+08 Shanghai"],
+      ["Asia/Tokyo", "UTC+09 Tokyo"],
+      ["Australia/Sydney", "UTC+10 Sydney"],
+      ["Pacific/Noumea", "UTC+11 Noumea"],
+      ["Pacific/Auckland", "UTC+12 Auckland"],
+      ["Pacific/Apia", "UTC+13 Apia"],
+      ["Pacific/Kiritimati", "UTC+14 Kiritimati"],
     ];
     let heatmapPanDrag = null;
 
@@ -4648,8 +4666,9 @@ HTML_TEMPLATE = r"""<!doctype html>
         ["events", "Events", number(bucket.events || 0)],
         ["reasoning", "Reasoning Tokens", compact(usage.reasoningOutput)],
       ];
+      const visibleSummaryCount = 12;
       const summaryClass = state.selectedSummaryExpanded ? "expanded" : "collapsed";
-      const hiddenMetricCount = Math.max(0, summaryCards.length - 3);
+      const hiddenMetricCount = Math.max(0, summaryCards.length - visibleSummaryCount);
       document.getElementById("dayDetails").innerHTML = `
         <div class="day-title">
           <div>
@@ -4662,10 +4681,10 @@ HTML_TEMPLATE = r"""<!doctype html>
           <div class="output" title="Output share"></div>
         </div>
         <div class="selected-summary ${summaryClass}">
-          ${summaryCards.map((card, index) => kpiCard(card[0], card[1], card[2], card[3] || "", index >= 3 ? "summary-extra" : "")).join("")}
+          ${summaryCards.map((card, index) => kpiCard(card[0], card[1], card[2], card[3] || "", index >= visibleSummaryCount ? "summary-extra" : "")).join("")}
         </div>
         <button type="button" class="selected-summary-toggle" id="selectedSummaryToggle">
-          ${state.selectedSummaryExpanded ? "Show fewer metrics" : `Show ${hiddenMetricCount} more metrics`}
+          ${state.selectedSummaryExpanded ? "Show fewer metrics ^" : `Show ${hiddenMetricCount} more metrics v`}
         </button>
       `;
       attachKpiTooltips();
@@ -4789,22 +4808,17 @@ HTML_TEMPLATE = r"""<!doctype html>
       document.getElementById("topSessionsCaption").textContent = `Top ${top.length} of ${DATA.sessions.length}`;
       document.getElementById("topSessions").innerHTML = top.map(item => {
         const relativeShare = Math.max(0, Math.min(100, (item.usage.total || 0) / max * 100));
-        const inputShare = Math.max(0, Math.min(100, (item.usage.input || 0) / Math.max(1, item.usage.total || 0) * 100));
-        const outputShare = Math.max(0, Math.min(100, (item.usage.output || 0) / Math.max(1, item.usage.total || 0) * 100));
         return `
           <article class="top-item">
-            <h3>${sessionTitleMarkup(item.title)}</h3>
+            <h3 title="${escapeHtml(item.title)}">${escapeHtml(item.title || "Untitled Codex session")}</h3>
             <div class="top-meta">
               <span>${compact(item.usage.total)} Tokens</span>
               <span>${money(costForByModel(item.byModel, item.usage))}</span>
               <span>${escapeHtml(item.model)}</span>
               ${item.deviceName ? `<span>${escapeHtml(item.deviceName)}</span>` : ""}
             </div>
-            <div class="progress" title="${Math.round(relativeShare)}% of top session, split by Total Input Tokens and Output Tokens">
-              <div class="progress-fill" style="width:${relativeShare}%">
-                <div class="input" style="width:${inputShare}%"></div>
-                <div class="output" style="width:${outputShare}%"></div>
-              </div>
+            <div class="progress" title="${Math.round(relativeShare)}% of top session by Total Tokens">
+              <div class="progress-fill" style="width:${relativeShare}%"></div>
             </div>
             <div class="top-meta">
               <span>${item.lastSeen ? new Date(item.lastSeen).toLocaleString() : ""}</span>
