@@ -16,6 +16,7 @@ codex_usage_data.json
 
 # Local Claude worktrees and generated assistant artifacts
 .claude/
+.local-notes/
 
 # Local environments and secrets
 .env

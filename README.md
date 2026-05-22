@@ -115,6 +115,16 @@ Snapshots include dashboard-level analytics only: token/time series, model usage
 
 The dashboard defaults to **All devices** and includes a device selector in the header so you can filter the full view down to one device.
 
+## Project Aliases
+
+Codex stores the working directory name that was active when a session ran. If you rename a folder later, old sessions can still appear under the historical project name. You can add a local display alias without editing Codex logs or synced snapshots:
+
+```bash
+npx codex-analytics-dashboard@latest -- --project-alias "Old project name=New project name"
+```
+
+Aliases are saved in the user-local app config and are applied when the dashboard aggregates sessions and snapshots. For example, `--project-alias "New project=Thesis-DSDE"` groups historical `New project` sessions under `Thesis-DSDE` in the dashboard output only.
+
 ## Outputs
 
 The Python defaults write to the current directory:

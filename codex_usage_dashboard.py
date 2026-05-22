@@ -50,10 +50,25 @@ SNAPSHOT_SCHEMA_VERSION = 1
 SNAPSHOT_PRIVACY_LEVEL = "projects"
 APP_NAME = "Codex Analytics Dashboard"
 CONFIG_FILE_NAME = "config.json"
+USER_WORD_RE = re.compile(r"[^\W_]+(?:['’-][^\W_]+)*", re.UNICODE)
+TIMEZONE_NAME_RE = re.compile(r"^[A-Za-z0-9_+\-./]{1,80}$")
 
 
 def default_timezone_name() -> str:
     return os.environ.get("TZ") or "UTC"
+
+
+def valid_timezone_name(value: str | None) -> str | None:
+    if not value:
+        return None
+    timezone_name = value.strip()
+    if not TIMEZONE_NAME_RE.fullmatch(timezone_name):
+        return None
+    try:
+        ZoneInfo(timezone_name)
+    except Exception:
+        return None
+    return timezone_name
 
 
 def app_data_dir() -> Path:
@@ -88,6 +103,45 @@ def save_config(config: dict[str, Any]) -> None:
     tmp = path.with_name(f"{path.name}.tmp-{os.getpid()}")
     tmp.write_text(json.dumps(config, indent=2, ensure_ascii=False), encoding="utf-8")
     tmp.replace(path)
+
+
+def parse_project_alias(value: str) -> tuple[str, str] | None:
+    if "=" not in value:
+        return None
+    source, target = value.split("=", 1)
+    source = " ".join(source.strip().split())
+    target = " ".join(target.strip().split())
+    if not source or not target:
+        return None
+    return source, target
+
+
+def alias_key(value: Any) -> str:
+    return " ".join(str(value or "").strip().split()).casefold()
+
+
+def config_project_aliases(config: dict[str, Any]) -> dict[str, str]:
+    aliases = config.get("projectAliases")
+    if not isinstance(aliases, dict):
+        return {}
+    return {alias_key(source): str(target) for source, target in aliases.items() if alias_key(source) and str(target).strip()}
+
+
+def resolve_project_aliases(args: argparse.Namespace) -> dict[str, str]:
+    config = load_config()
+    aliases = config_project_aliases(config)
+    raw_values = args.project_alias or []
+    if raw_values:
+        stored = dict(config.get("projectAliases") or {})
+        for value in raw_values:
+            parsed = parse_project_alias(value)
+            if parsed:
+                source, target = parsed
+                aliases[alias_key(source)] = target
+                stored[source] = target
+        config["projectAliases"] = dict(sorted(stored.items()))
+        save_config(config)
+    return aliases
 
 
 def default_device_name() -> str:
@@ -227,6 +281,28 @@ class MessageEvents:
 
 
 @dataclass
+class UserTextStats:
+    messages: int = 0
+    words: int = 0
+
+    def add_message(self, text: str) -> None:
+        self.messages += 1
+        self.words += count_user_words(text)
+
+    def add(self, other: "UserTextStats") -> None:
+        self.messages += other.messages
+        self.words += other.words
+
+    def to_json(self) -> dict[str, int | float]:
+        average = round(self.words / self.messages, 2) if self.messages else 0
+        return {
+            "messages": self.messages,
+            "words": self.words,
+            "avgWordsPerMessage": average,
+        }
+
+
+@dataclass
 class SessionMeta:
     thread_id: str
     title: str = "Untitled Codex session"
@@ -256,6 +332,7 @@ class SessionAggregate:
     days: set[str] = field(default_factory=set)
     event_count: int = 0
     message_events: MessageEvents = field(default_factory=MessageEvents)
+    user_text: UserTextStats = field(default_factory=UserTextStats)
 
 
 @dataclass
@@ -313,6 +390,16 @@ def parse_args() -> argparse.Namespace:
         "--device-name",
         default="",
         help="Friendly name for this device in synced dashboards. Defaults to a generic OS label.",
+    )
+    parser.add_argument(
+        "--project-alias",
+        action="append",
+        default=[],
+        metavar="OLD=NEW",
+        help=(
+            "Rename a project bucket in generated dashboard output, for example "
+            "'New project=Thesis-DSDE'. Can be passed multiple times and is saved in user-local config."
+        ),
     )
     parser.add_argument(
         "--no-snapshot",
@@ -399,6 +486,14 @@ def normalize_model(model: str | None) -> str:
     if model in MODEL_PRICES:
         return model
     lowered = model.lower()
+    if "codex" in lowered and re.search(r"(?:gpt[- ]*)?5\.3.*spark|spark.*(?:gpt[- ]*)?5\.3", lowered):
+        return "codex-gpt-5.3-spark"
+    if re.search(r"gpt[- ]*5\.3.*spark|spark.*gpt[- ]*5\.3", lowered):
+        return "gpt-5.3-spark"
+    if "codex" in lowered and re.search(r"(?:gpt[- ]*)?5\.3", lowered):
+        return "codex-gpt-5.3"
+    if re.search(r"gpt[- ]*5\.3", lowered):
+        return "gpt-5.3"
     if "gpt-5.4-mini" in lowered:
         return "gpt-5.4-mini"
     if "gpt-5.5" in lowered:
@@ -534,6 +629,31 @@ def add_message_event_to_bucket(bucket: dict[str, Any], payload_type: str, is_su
     message_events.add_type(payload_type, is_subagent)
 
 
+def count_user_words(text: str) -> int:
+    return len(USER_WORD_RE.findall(text or ""))
+
+
+def user_message_text(payload: dict[str, Any]) -> str:
+    message = payload.get("message")
+    if isinstance(message, str):
+        return message
+    text_elements = payload.get("text_elements")
+    if isinstance(text_elements, list):
+        parts: list[str] = []
+        for item in text_elements:
+            if isinstance(item, str):
+                parts.append(item)
+            elif isinstance(item, dict) and isinstance(item.get("text"), str):
+                parts.append(item["text"])
+        return "\n".join(parts)
+    return ""
+
+
+def add_user_text_to_bucket(bucket: dict[str, Any], user_text: UserTextStats) -> None:
+    bucket_user_text: UserTextStats = bucket.setdefault("user_text", UserTextStats())
+    bucket_user_text.add(user_text)
+
+
 def ensure_period_session(
     period_sessions: dict[str, dict[str, dict[str, Any]]],
     period_key: str,
@@ -559,6 +679,7 @@ def ensure_period_session(
             "by_model_effort": {},
             "events": 0,
             "message_events": MessageEvents(),
+            "user_text": UserTextStats(),
             "first_event": event_iso,
             "last_event": event_iso,
         },
@@ -651,10 +772,20 @@ def parse_rollout_file(
                 day = iso_date(local_dt)
                 hour = hour_key(local_dt)
                 model_for_event = current_model or normalize_model(session.model)
+                user_text = UserTextStats()
+                if payload_type == "user_message" and not is_subagent_session:
+                    user_text.add_message(user_message_text(payload))
                 session.days.add(day)
                 session.message_events.add_type(payload_type, is_subagent_session)
-                add_message_event_to_bucket(daily.setdefault(day, {}), payload_type, is_subagent_session)
-                add_message_event_to_bucket(hourly.setdefault(hour, {}), payload_type, is_subagent_session)
+                if user_text.messages:
+                    session.user_text.add(user_text)
+                daily_bucket = daily.setdefault(day, {})
+                hourly_bucket = hourly.setdefault(hour, {})
+                add_message_event_to_bucket(daily_bucket, payload_type, is_subagent_session)
+                add_message_event_to_bucket(hourly_bucket, payload_type, is_subagent_session)
+                if user_text.messages:
+                    add_user_text_to_bucket(daily_bucket, user_text)
+                    add_user_text_to_bucket(hourly_bucket, user_text)
                 for period_sessions, period_key in ((daily_sessions, day), (hourly_sessions, hour)):
                     period_session = ensure_period_session(
                         period_sessions,
@@ -667,6 +798,8 @@ def parse_rollout_file(
                         local_dt,
                     )
                     period_session["message_events"].add_type(payload_type, is_subagent_session)
+                    if user_text.messages:
+                        period_session["user_text"].add(user_text)
                 continue
 
             if row_type == "event_msg" and payload_type == "token_count":
@@ -769,6 +902,7 @@ def usage_bucket_json(
         by_model = bucket.get("by_model", {})
         by_model_effort = bucket.get("by_model_effort", {})
         message_events = bucket.get("message_events", MessageEvents())
+        user_text = bucket.get("user_text", UserTextStats())
         sessions_for_bucket = (session_buckets or {}).get(key, {})
         rows.append(
             {
@@ -778,6 +912,7 @@ def usage_bucket_json(
                 "byModelEffort": usage_json_by_model_effort(by_model_effort),
                 "events": int(bucket.get("events", 0)),
                 "messageEvents": message_events.to_json(),
+                "userText": user_text.to_json(),
                 "sessionCount": len(sessions_for_bucket),
             }
         )
@@ -801,6 +936,7 @@ def session_buckets_json(session_buckets: dict[str, dict[str, dict[str, Any]]]) 
                     "byModelEffort": usage_json_by_model_effort(item["by_model_effort"]),
                     "events": item["events"],
                     "messageEvents": item["message_events"].to_json(),
+                    "userText": item["user_text"].to_json(),
                     "firstEvent": item["first_event"],
                     "lastEvent": item["last_event"],
                 }
@@ -865,6 +1001,31 @@ def project_name_from_path(value: Any) -> str:
         return "No project captured"
     parts = [part for part in clean.split("/") if part and not re.fullmatch(r"[A-Za-z]:", part)]
     return parts[-1] if parts else "No project captured"
+
+
+def apply_project_aliases(payload: dict[str, Any], aliases: dict[str, str]) -> None:
+    if not aliases:
+        return
+
+    def alias_cwd(value: Any) -> Any:
+        project_name = project_name_from_path(value)
+        return aliases.get(alias_key(project_name), value)
+
+    def apply_to_rows(rows: Any) -> None:
+        if not isinstance(rows, list):
+            return
+        for row in rows:
+            if isinstance(row, dict) and "cwd" in row:
+                row["cwd"] = alias_cwd(row.get("cwd"))
+
+    apply_to_rows(payload.get("sessions"))
+    for bucket in (payload.get("dailySessions") or {}).values():
+        apply_to_rows(bucket)
+    for bucket in (payload.get("hourlySessions") or {}).values():
+        apply_to_rows(bucket)
+    for device_payload in (payload.get("devicePayloads") or {}).values():
+        if isinstance(device_payload, dict):
+            apply_project_aliases(device_payload, aliases)
 
 
 def snapshot_session_id(device_id: str, raw_id: Any) -> str:
@@ -1003,12 +1164,25 @@ def add_message_events_json(target: dict[str, int], source: dict[str, Any] | Non
         target[key] = int(target.get(key, 0) or 0) + int(source.get(key, 0) or 0)
 
 
+def add_user_text_json(target: dict[str, int | float], source: dict[str, Any] | None) -> None:
+    source = source or {}
+    target["messages"] = int(target.get("messages", 0) or 0) + int(source.get("messages", 0) or 0)
+    target["words"] = int(target.get("words", 0) or 0) + int(source.get("words", 0) or 0)
+    messages = int(target.get("messages", 0) or 0)
+    words = int(target.get("words", 0) or 0)
+    target["avgWordsPerMessage"] = round(words / messages, 2) if messages else 0
+
+
 def usage_zero_json() -> dict[str, int]:
     return {"input": 0, "cachedInput": 0, "output": 0, "reasoningOutput": 0, "total": 0}
 
 
 def message_events_zero_json() -> dict[str, int]:
     return {"total": 0, "user": 0, "agent": 0, "primaryAgent": 0, "subagentAgent": 0}
+
+
+def user_text_zero_json() -> dict[str, int | float]:
+    return {"messages": 0, "words": 0, "avgWordsPerMessage": 0}
 
 
 def add_by_model_json(target: dict[str, dict[str, int]], source: dict[str, Any] | None) -> None:
@@ -1040,6 +1214,7 @@ def aggregate_snapshot_rows(rows: list[dict[str, Any]], key_name: str) -> list[d
                 "byModelEffort": {},
                 "events": 0,
                 "messageEvents": message_events_zero_json(),
+                "userText": user_text_zero_json(),
                 "sessionCount": 0,
             },
         )
@@ -1047,6 +1222,7 @@ def aggregate_snapshot_rows(rows: list[dict[str, Any]], key_name: str) -> list[d
         add_by_model_json(bucket["byModel"], row.get("byModel"))
         add_by_model_effort_json(bucket["byModelEffort"], row.get("byModelEffort"))
         add_message_events_json(bucket["messageEvents"], row.get("messageEvents"))
+        add_user_text_json(bucket["userText"], row.get("userText"))
         bucket["events"] += int(row.get("events", 0) or 0)
         bucket["sessionCount"] += int(row.get("sessionCount", 0) or 0)
     return [buckets[key] for key in sorted(buckets)]
@@ -1078,6 +1254,7 @@ def combine_snapshot_payloads(snapshots: list[dict[str, Any]], tz_name: str) -> 
     price_sources = copy.deepcopy(first.get("meta", {}).get("priceSources", []))
 
     totals_usage = usage_zero_json()
+    totals_user_text = user_text_zero_json()
     totals_by_model: dict[str, dict[str, int]] = {}
     totals_by_model_effort: dict[str, dict[str, dict[str, int]]] = {}
     all_sessions: list[dict[str, Any]] = []
@@ -1089,6 +1266,7 @@ def combine_snapshot_payloads(snapshots: list[dict[str, Any]], tz_name: str) -> 
     for snapshot in valid_snapshots:
         totals = snapshot.get("totals", {})
         add_usage_json(totals_usage, totals.get("usage"))
+        add_user_text_json(totals_user_text, totals.get("userText"))
         add_by_model_json(totals_by_model, totals.get("byModel"))
         add_by_model_effort_json(totals_by_model_effort, totals.get("byModelEffort"))
         all_sessions.extend(copy.deepcopy([row for row in snapshot.get("sessions", []) if isinstance(row, dict)]))
@@ -1130,6 +1308,7 @@ def combine_snapshot_payloads(snapshots: list[dict[str, Any]], tz_name: str) -> 
         "pricing": pricing,
         "totals": {
             "usage": totals_usage,
+            "userText": totals_user_text,
             "byModel": dict(sorted(totals_by_model.items())),
             "byModelEffort": dict(sorted(totals_by_model_effort.items())),
             "costLoggedMix": cost_logged_mix,
@@ -1162,7 +1341,7 @@ def build_empty_payload(tz_name: str) -> dict[str, Any]:
             "devices": [],
         },
         "pricing": {"defaultModel": DEFAULT_MODEL, "models": MODEL_PRICES},
-        "totals": {"usage": usage_zero_json(), "byModel": {}, "byModelEffort": {}, "costLoggedMix": 0},
+        "totals": {"usage": usage_zero_json(), "userText": user_text_zero_json(), "byModel": {}, "byModelEffort": {}, "costLoggedMix": 0},
         "hourly": [],
         "daily": [],
         "dailySessions": {},
@@ -1189,10 +1368,12 @@ def build_payload(codex_home: Path, tz_name: str) -> dict[str, Any]:
             sessions.append(parsed)
 
     all_usage = Usage()
+    all_user_text = UserTextStats()
     all_by_model: dict[str, Usage] = {}
     all_by_model_effort: dict[str, dict[str, Usage]] = {}
     for session in sessions:
         all_usage.add(session.usage)
+        all_user_text.add(session.user_text)
         for model, usage in session.by_model.items():
             all_by_model.setdefault(model, Usage()).add(usage)
         for model, efforts in session.by_model_effort.items():
@@ -1208,6 +1389,7 @@ def build_payload(codex_home: Path, tz_name: str) -> dict[str, Any]:
         by_model = bucket.get("by_model", {})
         by_model_effort = bucket.get("by_model_effort", {})
         message_events = bucket.get("message_events", MessageEvents())
+        user_text = bucket.get("user_text", UserTextStats())
         sessions_for_day = daily_sessions.get(date, {})
         daily_json.append(
             {
@@ -1217,6 +1399,7 @@ def build_payload(codex_home: Path, tz_name: str) -> dict[str, Any]:
                 "byModelEffort": usage_json_by_model_effort(by_model_effort),
                 "events": int(bucket.get("events", 0)),
                 "messageEvents": message_events.to_json(),
+                "userText": user_text.to_json(),
                 "sessionCount": len(sessions_for_day),
             }
         )
@@ -1244,6 +1427,7 @@ def build_payload(codex_home: Path, tz_name: str) -> dict[str, Any]:
                 "days": sorted(session.days),
                 "events": session.event_count,
                 "messageEvents": session.message_events.to_json(),
+                "userText": session.user_text.to_json(),
             }
         )
     session_json.sort(key=lambda item: item["usage"]["total"], reverse=True)
@@ -1280,6 +1464,7 @@ def build_payload(codex_home: Path, tz_name: str) -> dict[str, Any]:
         },
         "totals": {
             "usage": all_usage.to_json(),
+            "userText": all_user_text.to_json(),
             "byModel": usage_json_by_model(all_by_model),
             "byModelEffort": usage_json_by_model_effort(all_by_model_effort),
             "costLoggedMix": sum(usage_cost(usage, model) for model, usage in all_by_model.items()),
@@ -1735,6 +1920,8 @@ HTML_TEMPLATE = r"""<!doctype html>
       background: var(--panel-soft);
       padding: 10px;
       min-height: 70px;
+      display: flex;
+      flex-direction: column;
     }
     .mini.has-help {
       cursor: help;
@@ -1769,11 +1956,13 @@ HTML_TEMPLATE = r"""<!doctype html>
       color: var(--muted);
       font-size: 12px;
       margin-bottom: 6px;
+      padding-right: 20px;
     }
     .mini strong {
       display: block;
       font-size: clamp(16px, 1.8vw, 18px);
       line-height: 1.12;
+      margin-top: auto;
       white-space: nowrap;
     }
     .heatmap-tools {
@@ -2104,6 +2293,60 @@ HTML_TEMPLATE = r"""<!doctype html>
       max-width: 460px;
       overflow-wrap: anywhere;
     }
+    .session-title-toggle {
+      width: 100%;
+      min-width: 0;
+      border: 0;
+      background: transparent;
+      color: inherit;
+      cursor: pointer;
+      display: grid;
+      grid-template-columns: minmax(0, 1fr) 18px;
+      gap: 6px;
+      align-items: start;
+      padding: 0;
+      text-align: left;
+      font: inherit;
+      font-weight: inherit;
+    }
+    .session-title-toggle::after {
+      content: "v";
+      display: grid;
+      place-items: center;
+      width: 18px;
+      height: 18px;
+      border: 1px solid var(--line);
+      border-radius: 50%;
+      color: var(--muted);
+      font-size: 10px;
+      font-weight: 800;
+      line-height: 1;
+      transition: transform 140ms ease;
+    }
+    .session-title-toggle:hover .session-title-text {
+      text-decoration: underline;
+      text-underline-offset: 3px;
+    }
+    .session-title-toggle:focus-visible {
+      outline: 2px solid var(--ink);
+      outline-offset: 2px;
+      border-radius: 4px;
+    }
+    .session-title-toggle.session-title-expanded::after {
+      transform: rotate(180deg);
+    }
+    .session-title-text {
+      min-width: 0;
+      overflow: hidden;
+      text-overflow: ellipsis;
+      white-space: nowrap;
+    }
+    .session-title-toggle.session-title-expanded .session-title-text {
+      overflow: visible;
+      overflow-wrap: anywhere;
+      text-overflow: clip;
+      white-space: normal;
+    }
     .session-sub {
       color: var(--muted);
       font-size: 12px;
@@ -2138,10 +2381,6 @@ HTML_TEMPLATE = r"""<!doctype html>
       overflow-wrap: anywhere;
     }
     .top-sessions-panel .top-item h3 {
-      display: -webkit-box;
-      -webkit-line-clamp: 2;
-      -webkit-box-orient: vertical;
-      overflow: hidden;
       font-size: 13px;
     }
     .top-meta {
@@ -2162,6 +2401,10 @@ HTML_TEMPLATE = r"""<!doctype html>
       background: #e0e6df;
       margin-top: 10px;
       display: flex;
+    }
+    .progress-fill {
+      display: flex;
+      height: 100%;
     }
     .progress .input { background: var(--input); }
     .progress .output { background: var(--output); }
@@ -2323,6 +2566,10 @@ HTML_TEMPLATE = r"""<!doctype html>
         <div class="control">
           <label for="deviceSelect">Device</label>
           <select id="deviceSelect"></select>
+        </div>
+        <div class="control">
+          <label for="timezoneSelect">Timezone</label>
+          <select id="timezoneSelect"></select>
         </div>
         <div class="control">
           <label for="rangeSelect">Range</label>
@@ -2525,9 +2772,40 @@ HTML_TEMPLATE = r"""<!doctype html>
     const HEATMAP_TOKEN_FULL_SCALE = 250_000_000;
     const HEATMAP_TOKEN_METRICS = new Set(["total", "input", "totalInput", "output"]);
     const HEATMAP_EMPTY_COLOR = "#e7ebe5";
+    const HEATMAP_COLOR_STEPS = 7;
+    const HEATMAP_SCALE_STEPS = [0, 1/7, 2/7, 3/7, 4/7, 5/7, 6/7, 1];
     const HEATMAP_PROJECT_GRADIENT = [
       [0.00, [47, 127, 121]],
       [1.00, [185, 133, 37]],
+    ];
+    const TIMEZONE_OPTIONS = [
+      ["Pacific/Pago_Pago", "UTC-11 - Pago Pago"],
+      ["Pacific/Honolulu", "UTC-10 - Honolulu"],
+      ["America/Anchorage", "UTC-09 - Anchorage"],
+      ["America/Los_Angeles", "UTC-08 - Los Angeles"],
+      ["America/Denver", "UTC-07 - Denver"],
+      ["America/Chicago", "UTC-06 - Chicago"],
+      ["America/New_York", "UTC-05 - New York"],
+      ["America/Halifax", "UTC-04 - Halifax"],
+      ["America/Sao_Paulo", "UTC-03 - Sao Paulo"],
+      ["Atlantic/South_Georgia", "UTC-02 - South Georgia"],
+      ["Atlantic/Azores", "UTC-01 - Azores"],
+      ["UTC", "UTC - Coordinated Universal Time"],
+      ["Europe/London", "UTC+00 - London"],
+      ["Europe/Berlin", "UTC+01 - Berlin"],
+      ["Europe/Athens", "UTC+02 - Athens"],
+      ["Europe/Moscow", "UTC+03 - Moscow"],
+      ["Asia/Dubai", "UTC+04 - Dubai"],
+      ["Asia/Karachi", "UTC+05 - Karachi"],
+      ["Asia/Dhaka", "UTC+06 - Dhaka"],
+      ["Asia/Bangkok", "UTC+07 - Bangkok"],
+      ["Asia/Shanghai", "UTC+08 - Shanghai"],
+      ["Asia/Tokyo", "UTC+09 - Tokyo"],
+      ["Australia/Sydney", "UTC+10 - Sydney"],
+      ["Pacific/Noumea", "UTC+11 - Noumea"],
+      ["Pacific/Auckland", "UTC+12 - Auckland"],
+      ["Pacific/Apia", "UTC+13 - Apia"],
+      ["Pacific/Kiritimati", "UTC+14 - Kiritimati"],
     ];
     let heatmapPanDrag = null;
 
@@ -2545,6 +2823,10 @@ HTML_TEMPLATE = r"""<!doctype html>
       return { total: 0, user: 0, agent: 0, primaryAgent: 0, subagentAgent: 0 };
     }
 
+    function userTextZero() {
+      return { messages: 0, words: 0, avgWordsPerMessage: 0 };
+    }
+
     function addUsage(target, source) {
       target.input += source.input || 0;
       target.cachedInput += source.cachedInput || 0;
@@ -2560,6 +2842,13 @@ HTML_TEMPLATE = r"""<!doctype html>
       target.agent += source?.agent || 0;
       target.primaryAgent += source?.primaryAgent || 0;
       target.subagentAgent += source?.subagentAgent || 0;
+      return target;
+    }
+
+    function addUserText(target, source) {
+      target.messages += source?.messages || 0;
+      target.words += source?.words || 0;
+      target.avgWordsPerMessage = target.messages ? target.words / target.messages : 0;
       return target;
     }
 
@@ -3006,6 +3295,7 @@ HTML_TEMPLATE = r"""<!doctype html>
     function aggregate(days) {
       const usage = usageZero();
       const messageEvents = messageEventsZero();
+      const userText = userTextZero();
       const byModel = {};
       const byModelEffort = {};
       let events = 0;
@@ -3014,6 +3304,7 @@ HTML_TEMPLATE = r"""<!doctype html>
       for (const day of days) {
         addUsage(usage, day.usage);
         addMessageEvents(messageEvents, day.messageEvents);
+        addUserText(userText, day.userText);
         events += day.events || 0;
         sessions += day.sessionCount || 0;
         if ((day.usage.total || 0) > 0) activeDays += 1;
@@ -3023,7 +3314,7 @@ HTML_TEMPLATE = r"""<!doctype html>
         }
         addByModelEffortUsage(byModelEffort, day.byModelEffort || {});
       }
-      return { usage, byModel, byModelEffort, messageEvents, events, activeDays, sessions };
+      return { usage, byModel, byModelEffort, messageEvents, userText, events, activeDays, sessions };
     }
 
     function addByModelUsage(target, byModel) {
@@ -3053,6 +3344,7 @@ HTML_TEMPLATE = r"""<!doctype html>
         byModel: {},
         byModelEffort: {},
         messageEvents: messageEventsZero(),
+        userText: userTextZero(),
         events: 0,
         sessionCount: 0
       };
@@ -3064,6 +3356,7 @@ HTML_TEMPLATE = r"""<!doctype html>
       addByModelUsage(bucket.byModel, source.byModel || {});
       addByModelEffortUsage(bucket.byModelEffort, source.byModelEffort || {});
       addMessageEvents(bucket.messageEvents, source.messageEvents || messageEventsZero());
+      addUserText(bucket.userText, source.userText || userTextZero());
       bucket.events += source.events || 0;
       bucket.sessionCount += source.sessionCount || 0;
       return bucket;
@@ -3314,6 +3607,7 @@ HTML_TEMPLATE = r"""<!doctype html>
         byModel: {},
         byModelEffort: {},
         messageEvents: messageEventsZero(),
+        userText: userTextZero(),
         events: 0,
         sessionCount: 0
       };
@@ -3368,6 +3662,7 @@ HTML_TEMPLATE = r"""<!doctype html>
             usage: usageZero(),
             byModel: {},
             messageEvents: messageEventsZero(),
+            userText: userTextZero(),
             events: 0,
             firstEvent: row.firstEvent || "",
             lastEvent: row.lastEvent || ""
@@ -3377,6 +3672,7 @@ HTML_TEMPLATE = r"""<!doctype html>
         addUsage(target.usage, row.usage || usageZero());
         addByModelUsage(target.byModel, row.byModel || {});
         addMessageEvents(target.messageEvents, row.messageEvents || messageEventsZero());
+        addUserText(target.userText, row.userText || userTextZero());
         target.events += row.events || 0;
         if (row.firstEvent && (!target.firstEvent || row.firstEvent < target.firstEvent)) target.firstEvent = row.firstEvent;
         if (row.lastEvent && (!target.lastEvent || row.lastEvent > target.lastEvent)) target.lastEvent = row.lastEvent;
@@ -3434,6 +3730,33 @@ HTML_TEMPLATE = r"""<!doctype html>
       select.value = state.price;
     }
 
+    function currentTimezone() {
+      return DATA.meta?.timezone || ROOT_DATA.meta?.timezone || "UTC";
+    }
+
+    function renderTimezoneOptions() {
+      const select = document.getElementById("timezoneSelect");
+      if (!select) return;
+      const timezoneName = currentTimezone();
+      const options = TIMEZONE_OPTIONS.some(([value]) => value === timezoneName)
+        ? TIMEZONE_OPTIONS
+        : [[timezoneName, `${timezoneName} - current`], ...TIMEZONE_OPTIONS];
+      select.innerHTML = options.map(([value, label]) => `<option value="${escapeHtml(value)}">${escapeHtml(label)}</option>`).join("");
+      select.value = timezoneName;
+    }
+
+    function setTimezone(timezoneName) {
+      if (!timezoneName || timezoneName === currentTimezone()) return;
+      const select = document.getElementById("timezoneSelect");
+      if (window.location.protocol === "file:") {
+        if (select) select.value = currentTimezone();
+        return;
+      }
+      const url = new URL(window.location.href);
+      url.search = `?timezone=${encodeURIComponent(timezoneName)}`;
+      window.location.assign(url.toString());
+    }
+
     function availableDevices() {
       return Array.isArray(ROOT_DATA.meta?.devices) ? ROOT_DATA.meta.devices : [];
     }
@@ -3457,6 +3780,7 @@ HTML_TEMPLATE = r"""<!doctype html>
       state.selectedDate = null;
       renderPriceOptions();
       renderDeviceOptions();
+      renderTimezoneOptions();
       selectVisibleBucket();
       renderAll();
     }
@@ -3794,9 +4118,7 @@ HTML_TEMPLATE = r"""<!doctype html>
       return Math.max(1, observedMax || 0);
     }
 
-    function heatColor(value, maxValue) {
-      if (!value || maxValue <= 0) return HEATMAP_EMPTY_COLOR;
-      const t = Math.min(1, Math.max(0, value / maxValue));
+    function heatGradientColor(t) {
       const stops = HEATMAP_PROJECT_GRADIENT;
       let lo = stops[0], hi = stops[stops.length - 1];
       for (let i = 1; i < stops.length; i++) {
@@ -3809,6 +4131,13 @@ HTML_TEMPLATE = r"""<!doctype html>
       const local = (t - lo[0]) / Math.max(0.001, hi[0] - lo[0]);
       const rgb = lo[1].map((v, i) => Math.round(v + (hi[1][i] - v) * local));
       return `rgb(${rgb[0]}, ${rgb[1]}, ${rgb[2]})`;
+    }
+
+    function heatColor(value, maxValue) {
+      if (!value || maxValue <= 0) return HEATMAP_EMPTY_COLOR;
+      const t = Math.min(1, Math.max(0, value / maxValue));
+      const step = Math.max(1, Math.ceil(t * HEATMAP_COLOR_STEPS));
+      return heatGradientColor(step / HEATMAP_COLOR_STEPS);
     }
 
     function renderHeatmap() {
@@ -3878,7 +4207,7 @@ HTML_TEMPLATE = r"""<!doctype html>
         ? `warmer means more use; full color at ${compactAxis(HEATMAP_TOKEN_FULL_SCALE)} tokens.`
         : "warmer means more use.";
       document.getElementById("heatmapCaption").textContent = `${selectedYear} · ${weekCount} calendar weeks · ${metricLabel}; ${scaleNote}`;
-      document.getElementById("heatmapScale").innerHTML = [0, .25, .5, .75, 1].map(v => `<i style="background:${heatColor(maxValue * v, maxValue)}"></i>`).join("") + "<span>More</span>";
+      document.getElementById("heatmapScale").innerHTML = HEATMAP_SCALE_STEPS.map(v => `<i style="background:${heatColor(maxValue * v, maxValue)}"></i>`).join("") + "<span>More</span>";
       requestAnimationFrame(syncHeatmapPan);
     }
 
@@ -4009,6 +4338,8 @@ HTML_TEMPLATE = r"""<!doctype html>
       reasoning: "Subset of Output Tokens reported as Reasoning Tokens. These tokens are already included in Output Tokens and Total Tokens.",
       agentsSpawned: "Unique subagent sessions whose first captured timestamp falls inside the selected window. This counts spawned agents, not sub-agent messages.",
       messages: "Reconstructed Codex message events: user_message plus agent_message. Agent messages are also split into primary-agent and sub-agent sessions when metadata exposes that distinction. This is not the same as only manually typed chat messages.",
+      userWords: "Words counted from primary-session user_message text. This excludes tool results and file reads, and does not store the message text in synced snapshots.",
+      avgUserWords: "Average words per counted primary user message in the selected window.",
       events: "Number of token_count measurement points in the local Codex logs for the selected window. An event is a usage update, not necessarily a single message or session.",
       outputShare: "Share of Output Tokens within the selected window's Total Tokens. Lower values usually mean heavier context/input compared with generated replies."
     };
@@ -4041,6 +4372,15 @@ HTML_TEMPLATE = r"""<!doctype html>
       ].join("\n");
     }
 
+    function userTextBreakdownText(userText) {
+      const stats = userText || userTextZero();
+      return [
+        `Counted user messages: ${number(stats.messages || 0)}`,
+        `User words: ${number(stats.words || 0)}`,
+        "Based on stored user_message text only; prompts, responses, tool output, file reads, and local paths are not stored in synced snapshots."
+      ].join("\n");
+    }
+
     function agentsSpawnedForContext(context) {
       if (!context) return 0;
       const subagents = (DATA.sessions || []).filter(session => session.isSubagent);
@@ -4067,6 +4407,26 @@ HTML_TEMPLATE = r"""<!doctype html>
     function kpiCard(key, label, value, detail = "") {
       const description = KPI_HELP[key] || "";
       return `<div class="mini has-help" tabindex="0" data-kpi="${key}" data-title="${escapeHtml(label)}" data-description="${escapeHtml(description)}" data-detail="${escapeHtml(detail)}"><span>${label}</span><strong>${value}</strong></div>`;
+    }
+
+    function sessionTitleMarkup(title) {
+      const safeTitle = escapeHtml(title || "Untitled Codex session");
+      return `
+        <button class="session-title-toggle" type="button" aria-expanded="false" aria-label="Expand session title">
+          <span class="session-title-text">${safeTitle}</span>
+        </button>
+      `;
+    }
+
+    function toggleSessionTitle(button) {
+      const expanded = button.getAttribute("aria-expanded") === "true";
+      button.setAttribute("aria-expanded", expanded ? "false" : "true");
+      button.setAttribute("aria-label", expanded ? "Expand session title" : "Collapse session title");
+      button.classList.toggle("session-title-expanded", !expanded);
+      requestAnimationFrame(() => {
+        syncDetailsHeight();
+        syncBottomInsightsHeight();
+      });
     }
 
     function attachKpiTooltips() {
@@ -4121,6 +4481,8 @@ HTML_TEMPLATE = r"""<!doctype html>
       const rows = selectedSessionRows(context);
       const usage = bucket.usage || usageZero();
       const messageEvents = bucket.messageEvents || messageEventsZero();
+      const userText = bucket.userText || userTextZero();
+      const avgUserWords = userText.messages ? userText.words / userText.messages : 0;
       const totalIO = Math.max(1, (usage.input || 0) + (usage.output || 0));
       const inputShare = Math.max(1, Math.round((usage.input || 0) / totalIO * 100));
       const outputShare = Math.max(1, Math.round((usage.output || 0) / totalIO * 100));
@@ -4155,14 +4517,18 @@ HTML_TEMPLATE = r"""<!doctype html>
         <div class="summary-strip">
           ${kpiCard("sessions", "Sessions", number(rows.length))}
           ${kpiCard("messages", "Total Messages", number(messageEvents.total), messageBreakdownText(messageEvents))}
-          ${kpiCard("events", "Events", number(bucket.events || 0))}
-          ${kpiCard("reasoning", "Reasoning Tokens", compact(usage.reasoningOutput))}
+          ${kpiCard("userWords", "User Words", number(userText.words || 0), userTextBreakdownText(userText))}
+          ${kpiCard("avgUserWords", "Avg Words / Message", avgUserWords.toFixed(1), userTextBreakdownText(userText))}
         </div>
         <div class="summary-strip">
           ${kpiCard("totalInput", "Total Input Tokens", compact(usage.input), inputBreakdownText(usage))}
           ${kpiCard("cacheShare", "Cache Share", precisePct(usage.input ? usage.cachedInput / usage.input * 100 : 0), inputBreakdownText(usage))}
           ${kpiCard("outputShare", "Output Share", precisePct(usage.total ? usage.output / usage.total * 100 : 0))}
           ${kpiCard("agentsSpawned", "Agents Spawned", number(agentsSpawned), agentsSpawnedText(agentsSpawned))}
+        </div>
+        <div class="summary-strip">
+          ${kpiCard("events", "Events", number(bucket.events || 0))}
+          ${kpiCard("reasoning", "Reasoning Tokens", compact(usage.reasoningOutput))}
         </div>
       `;
       attachKpiTooltips();
@@ -4195,7 +4561,7 @@ HTML_TEMPLATE = r"""<!doctype html>
             ${rows.map(row => `
               <tr>
                 <td>
-                  <div class="session-title">${escapeHtml(row.title)}</div>
+                  <div class="session-title">${sessionTitleMarkup(row.title)}</div>
                   <div class="session-sub">${escapeHtml([row.model, row.cwd || "No cwd captured", row.deviceName].filter(Boolean).join(" · "))}</div>
                 </td>
                 <td>${compact(row.usage.total)}</td>
@@ -4262,24 +4628,27 @@ HTML_TEMPLATE = r"""<!doctype html>
       const max = Math.max(1, ...top.map(item => item.usage.total || 0));
       document.getElementById("topSessionsCaption").textContent = `Top ${top.length} of ${DATA.sessions.length}`;
       document.getElementById("topSessions").innerHTML = top.map(item => {
+        const relativeShare = Math.max(0, Math.min(100, (item.usage.total || 0) / max * 100));
         const inputShare = Math.max(0, Math.min(100, (item.usage.input || 0) / Math.max(1, item.usage.total || 0) * 100));
         const outputShare = Math.max(0, Math.min(100, (item.usage.output || 0) / Math.max(1, item.usage.total || 0) * 100));
         return `
           <article class="top-item">
-            <h3>${escapeHtml(item.title)}</h3>
+            <h3>${sessionTitleMarkup(item.title)}</h3>
             <div class="top-meta">
               <span>${compact(item.usage.total)} Tokens</span>
               <span>${money(costForByModel(item.byModel, item.usage))}</span>
               <span>${escapeHtml(item.model)}</span>
               ${item.deviceName ? `<span>${escapeHtml(item.deviceName)}</span>` : ""}
             </div>
-            <div class="progress" title="Total Input Tokens and Output Tokens split">
-              <div class="input" style="width:${inputShare}%"></div>
-              <div class="output" style="width:${outputShare}%"></div>
+            <div class="progress" title="${Math.round(relativeShare)}% of top session, split by Total Input Tokens and Output Tokens">
+              <div class="progress-fill" style="width:${relativeShare}%">
+                <div class="input" style="width:${inputShare}%"></div>
+                <div class="output" style="width:${outputShare}%"></div>
+              </div>
             </div>
             <div class="top-meta">
               <span>${item.lastSeen ? new Date(item.lastSeen).toLocaleString() : ""}</span>
-              <span>${Math.round((item.usage.total || 0) / max * 100)}% of top session</span>
+              <span>${Math.round(relativeShare)}% of top session</span>
             </div>
           </article>
         `;
@@ -4489,6 +4858,9 @@ HTML_TEMPLATE = r"""<!doctype html>
     document.getElementById("deviceSelect").addEventListener("change", event => {
       setActiveDevice(event.target.value);
     });
+    document.getElementById("timezoneSelect").addEventListener("change", event => {
+      setTimezone(event.target.value);
+    });
     document.getElementById("heatMetric").addEventListener("change", event => {
       state.heatMetric = event.target.value;
       renderAll();
@@ -4497,6 +4869,11 @@ HTML_TEMPLATE = r"""<!doctype html>
       state.heatYear = Number(event.target.value);
       state.heatScrollLeft = 0;
       renderAll();
+    });
+    document.addEventListener("click", event => {
+      const button = event.target.closest(".session-title-toggle");
+      if (!button) return;
+      toggleSessionTitle(button);
     });
     document.getElementById("heatmapPan").addEventListener("pointerdown", event => {
       const pan = event.currentTarget;
@@ -4592,6 +4969,7 @@ HTML_TEMPLATE = r"""<!doctype html>
     refreshDataIndexes();
     renderPriceOptions();
     renderDeviceOptions();
+    renderTimezoneOptions();
     renderAll();
   </script>
 </body>
@@ -4613,13 +4991,18 @@ def build_dashboard_payload(
     redact: bool = False,
     snapshot_dir: Path | None = None,
     device: SnapshotDevice | None = None,
+    project_aliases: dict[str, str] | None = None,
 ) -> dict[str, Any]:
+    aliases = project_aliases or {}
     raw_payload = build_payload(codex_home, timezone_name)
+    apply_project_aliases(raw_payload, aliases)
     if snapshot_dir and device:
         current_snapshot = create_snapshot_payload(raw_payload, device)
         write_device_snapshot(snapshot_dir, current_snapshot)
         snapshots = load_snapshot_payloads(snapshot_dir)
-        return combine_snapshot_payloads(snapshots, timezone_name)
+        combined_payload = combine_snapshot_payloads(snapshots, timezone_name)
+        apply_project_aliases(combined_payload, aliases)
+        return combined_payload
     if redact:
         redact_payload(raw_payload)
     return raw_payload
@@ -4646,6 +5029,7 @@ def generate_with_current_source(
     snapshot_dir: Path | None = None,
     device_name: str = "",
     no_snapshot: bool = False,
+    project_aliases: dict[str, str] | None = None,
 ) -> dict[str, Any]:
     command = [
         sys.executable,
@@ -4671,6 +5055,8 @@ def generate_with_current_source(
         command.extend(["--device-name", device_name])
     if no_snapshot:
         command.append("--no-snapshot")
+    for source_key, target in sorted((project_aliases or {}).items()):
+        command.extend(["--project-alias", f"{source_key}={target}"])
 
     result = subprocess.run(command, capture_output=True, text=True, check=False)
     if result.returncode != 0:
@@ -4682,7 +5068,7 @@ def generate_with_current_source(
 
     snapshot_setup = None if no_snapshot else resolve_snapshot_setup(argparse.Namespace(snapshot_dir=str(snapshot_dir or ""), device_name=device_name, no_snapshot=no_snapshot))
     local_snapshot_dir, local_device = snapshot_setup if snapshot_setup else (None, None)
-    return build_dashboard_payload(codex_home, timezone_name, redact, local_snapshot_dir, local_device)
+    return build_dashboard_payload(codex_home, timezone_name, redact, local_snapshot_dir, local_device, project_aliases)
 
 
 def find_available_port(start_port: int) -> int:
@@ -4725,12 +5111,18 @@ def make_refreshing_handler(
         def do_GET(self) -> None:
             parsed = urllib.parse.urlparse(self.path)
             path = urllib.parse.unquote(parsed.path)
+            query = urllib.parse.parse_qs(parsed.query)
+            requested_timezone = (query.get("timezone") or [""])[0]
+            timezone_override = valid_timezone_name(requested_timezone)
+            if requested_timezone and not timezone_override:
+                self.send_error(400, "Unsupported timezone")
+                return
             if path in ("", "/"):
                 path = f"/{dashboard_name}"
-                self.path = path
+                self.path = f"{path}?{parsed.query}" if parsed.query else path
             if Path(path).name in refresh_names:
                 try:
-                    refresh_outputs()
+                    refresh_outputs(timezone_override)
                 except Exception as exc:
                     self.send_error(500, f"Could not refresh dashboard: {exc}")
                     return
@@ -4787,21 +5179,24 @@ def main() -> None:
     url_file = Path(args.server_url_file).expanduser().resolve() if args.server_url_file else None
     generator_source = resolve_generator_source(args.generator_source)
     snapshot_dir, snapshot_device = resolve_snapshot_setup(args)
+    project_aliases = resolve_project_aliases(args)
 
-    def refresh_outputs() -> dict[str, Any]:
+    def refresh_outputs(timezone_override: str | None = None) -> dict[str, Any]:
+        timezone_name = timezone_override or args.timezone
         if args.serve and generator_source:
             return generate_with_current_source(
                 generator_source,
                 codex_home,
-                args.timezone,
+                timezone_name,
                 out,
                 json_out,
                 args.redact,
                 snapshot_dir,
                 args.device_name,
                 args.no_snapshot,
+                project_aliases,
             )
-        refreshed_payload = build_dashboard_payload(codex_home, args.timezone, args.redact, snapshot_dir, snapshot_device)
+        refreshed_payload = build_dashboard_payload(codex_home, timezone_name, args.redact, snapshot_dir, snapshot_device, project_aliases)
         write_outputs(refreshed_payload, out, json_out)
         return refreshed_payload
 
