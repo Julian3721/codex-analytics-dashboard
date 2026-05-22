@@ -43,6 +43,7 @@ MODEL_PRICES = {
     "gpt-5": {"input": 1.25, "cached_input": 0.125, "output": 10.00},
 }
 
+APP_VERSION = "0.2.3"
 DEFAULT_MODEL = "gpt-5.5"
 ROLLOUT_ID_RE = re.compile(r"rollout-\d{4}-\d{2}-\d{2}T\d{2}-\d{2}-\d{2}-(?P<id>[0-9a-f-]{36})\.jsonl$")
 REDACTED_PATH = "Redacted path"
@@ -50,6 +51,7 @@ SNAPSHOT_SCHEMA_VERSION = 1
 SNAPSHOT_PRIVACY_LEVEL = "projects"
 APP_NAME = "Codex Analytics Dashboard"
 CONFIG_FILE_NAME = "config.json"
+PROJECT_ALIASES_FILE_NAME = "project_aliases.json"
 USER_WORD_RE = re.compile(r"[^\W_]+(?:['’-][^\W_]+)*", re.UNICODE)
 TIMEZONE_NAME_RE = re.compile(r"^[A-Za-z0-9_+\-./]{1,80}$")
 
@@ -86,6 +88,29 @@ def config_path() -> Path:
     return app_data_dir() / CONFIG_FILE_NAME
 
 
+def project_aliases_path() -> Path:
+    return app_data_dir() / PROJECT_ALIASES_FILE_NAME
+
+
+def default_project_aliases_document() -> dict[str, Any]:
+    return {
+        "version": 1,
+        "projects": [],
+        "_help": (
+            "Add entries like {'name': 'Current Project Name', "
+            "'aliases': ['Old Project Name', 'C:/old/path/Old Project Name']}."
+        ),
+    }
+
+
+def ensure_project_aliases_file() -> Path:
+    path = project_aliases_path()
+    if not path.exists():
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps(default_project_aliases_document(), indent=2, ensure_ascii=False), encoding="utf-8")
+    return path
+
+
 def load_config() -> dict[str, Any]:
     path = config_path()
     if not path.exists():
@@ -120,16 +145,84 @@ def alias_key(value: Any) -> str:
     return " ".join(str(value or "").strip().split()).casefold()
 
 
+def add_project_alias(aliases: dict[str, str], source: Any, target: Any) -> None:
+    target_name = " ".join(str(target or "").strip().split())
+    if not target_name:
+        return
+    sources = {str(source or "").strip(), project_name_from_path(source)}
+    for candidate in sources:
+        key = alias_key(candidate)
+        if key and candidate != "No project captured":
+            aliases[key] = target_name
+
+
 def config_project_aliases(config: dict[str, Any]) -> dict[str, str]:
     aliases = config.get("projectAliases")
     if not isinstance(aliases, dict):
         return {}
-    return {alias_key(source): str(target) for source, target in aliases.items() if alias_key(source) and str(target).strip()}
+    resolved: dict[str, str] = {}
+    for source, target in aliases.items():
+        add_project_alias(resolved, source, target)
+    return resolved
+
+
+def file_project_aliases() -> dict[str, str]:
+    path = ensure_project_aliases_file()
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return {}
+    resolved: dict[str, str] = {}
+    if isinstance(data.get("aliases"), dict):
+        for source, target in data["aliases"].items():
+            add_project_alias(resolved, source, target)
+    projects = data.get("projects")
+    if isinstance(projects, list):
+        for item in projects:
+            if not isinstance(item, dict):
+                continue
+            target = item.get("name") or item.get("project") or item.get("canonical")
+            sources: list[Any] = []
+            for key in ("aliases", "matches", "paths"):
+                values = item.get(key)
+                if isinstance(values, list):
+                    sources.extend(values)
+            for source in sources:
+                add_project_alias(resolved, source, target)
+    return resolved
+
+
+def save_project_alias_file_entry(source: str, target: str) -> None:
+    path = ensure_project_aliases_file()
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        data = default_project_aliases_document()
+    projects = data.setdefault("projects", [])
+    if not isinstance(projects, list):
+        projects = []
+        data["projects"] = projects
+    match = None
+    for item in projects:
+        if isinstance(item, dict) and alias_key(item.get("name")) == alias_key(target):
+            match = item
+            break
+    if match is None:
+        match = {"name": target, "aliases": []}
+        projects.append(match)
+    values = match.setdefault("aliases", [])
+    if not isinstance(values, list):
+        values = []
+        match["aliases"] = values
+    if source not in values:
+        values.append(source)
+    path.write_text(json.dumps(data, indent=2, ensure_ascii=False), encoding="utf-8")
 
 
 def resolve_project_aliases(args: argparse.Namespace) -> dict[str, str]:
     config = load_config()
     aliases = config_project_aliases(config)
+    aliases.update(file_project_aliases())
     raw_values = args.project_alias or []
     if raw_values:
         stored = dict(config.get("projectAliases") or {})
@@ -137,8 +230,9 @@ def resolve_project_aliases(args: argparse.Namespace) -> dict[str, str]:
             parsed = parse_project_alias(value)
             if parsed:
                 source, target = parsed
-                aliases[alias_key(source)] = target
+                add_project_alias(aliases, source, target)
                 stored[source] = target
+                save_project_alias_file_entry(source, target)
         config["projectAliases"] = dict(sorted(stored.items()))
         save_config(config)
     return aliases
@@ -398,7 +492,7 @@ def parse_args() -> argparse.Namespace:
         metavar="OLD=NEW",
         help=(
             "Rename a project bucket in generated dashboard output, for example "
-            "'New project=Thesis-DSDE'. Can be passed multiple times and is saved in user-local config."
+            "'Old project=Current project'. Can be passed multiple times and is saved in the user-local project aliases file."
         ),
     )
     parser.add_argument(
@@ -1295,6 +1389,7 @@ def combine_snapshot_payloads(snapshots: list[dict[str, Any]], tz_name: str) -> 
     return {
         "meta": {
             "generatedAt": generated_at,
+            "appVersion": APP_VERSION,
             "timezone": tz_name,
             "codexHome": "synced snapshots",
             "sessionFiles": session_files,
@@ -1330,6 +1425,7 @@ def build_empty_payload(tz_name: str) -> dict[str, Any]:
     return {
         "meta": {
             "generatedAt": datetime.now(ZoneInfo(tz_name)).isoformat(timespec="seconds"),
+            "appVersion": APP_VERSION,
             "timezone": tz_name,
             "codexHome": "synced snapshots",
             "sessionFiles": 0,
@@ -1436,6 +1532,7 @@ def build_payload(codex_home: Path, tz_name: str) -> dict[str, Any]:
     return {
         "meta": {
             "generatedAt": generated_at,
+            "appVersion": APP_VERSION,
             "timezone": tz_name,
             "codexHome": str(codex_home),
             "sessionFiles": len(iter_rollout_files(codex_home)),
@@ -1520,16 +1617,17 @@ HTML_TEMPLATE = r"""<!doctype html>
     }
     header {
       display: grid;
-      grid-template-columns: 1fr auto;
+      grid-template-columns: minmax(420px, 1fr) auto;
       gap: 24px;
       align-items: end;
       margin-bottom: 18px;
     }
     h1 {
       margin: 0;
-      font-size: clamp(30px, 4vw, 54px);
+      font-size: 42px;
       line-height: 1;
       letter-spacing: 0;
+      white-space: nowrap;
     }
     h2 {
       margin: 0 0 12px;
@@ -1913,6 +2011,29 @@ HTML_TEMPLATE = r"""<!doctype html>
     .summary-strip.three-up {
       grid-template-columns: repeat(3, minmax(0, 1fr));
     }
+    .selected-summary {
+      display: grid;
+      grid-template-columns: repeat(3, minmax(0, 1fr));
+      gap: 10px;
+      margin-top: 12px;
+    }
+    .selected-summary.collapsed .summary-extra {
+      display: none;
+    }
+    .selected-summary-toggle {
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      background: var(--panel);
+      color: var(--ink);
+      cursor: pointer;
+      font-weight: 750;
+      margin-top: 10px;
+      min-height: 36px;
+      padding: 7px 10px;
+    }
+    .selected-summary-toggle:hover {
+      background: var(--panel-soft);
+    }
     .mini {
       position: relative;
       border: 1px solid var(--line);
@@ -2232,6 +2353,14 @@ HTML_TEMPLATE = r"""<!doctype html>
     .model-table {
       min-width: 1180px;
     }
+    #sessionTable table {
+      min-width: 960px;
+    }
+    #sessionTable th:first-child,
+    #sessionTable td:first-child {
+      min-width: 420px;
+      width: 420px;
+    }
     .model-toggle {
       border: 0;
       background: transparent;
@@ -2514,6 +2643,7 @@ HTML_TEMPLATE = r"""<!doctype html>
       }
       .details { height: auto !important; }
       header { grid-template-columns: 1fr; }
+      h1 { font-size: 34px; }
       .toolbar { justify-content: flex-start; }
     }
     @media (max-width: 720px) {
@@ -2521,9 +2651,11 @@ HTML_TEMPLATE = r"""<!doctype html>
         width: min(100% - 20px, 1440px);
         padding-top: 18px;
       }
+      h1 { font-size: 28px; }
       .stat-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); }
       .summary-strip { grid-template-columns: repeat(2, minmax(0, 1fr)); }
       .summary-strip.three-up { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+      .selected-summary { grid-template-columns: repeat(2, minmax(0, 1fr)); }
       .stat { min-height: 104px; }
       .control {
         width: 100%;
@@ -2552,6 +2684,9 @@ HTML_TEMPLATE = r"""<!doctype html>
       }
       select { min-width: 150px; }
       svg { min-width: 620px; }
+    }
+    @media (max-width: 460px) {
+      h1 { font-size: 23px; }
     }
   </style>
 </head>
@@ -2762,7 +2897,8 @@ HTML_TEMPLATE = r"""<!doctype html>
       heatYear: null,
       heatScrollLeft: 0,
       selectedChartKey: null,
-      selectedDate: null
+      selectedDate: null,
+      selectedSummaryExpanded: false
     };
 
     let byDate = new Map();
@@ -4404,9 +4540,10 @@ HTML_TEMPLATE = r"""<!doctype html>
       ].join("\n");
     }
 
-    function kpiCard(key, label, value, detail = "") {
+    function kpiCard(key, label, value, detail = "", extraClass = "") {
       const description = KPI_HELP[key] || "";
-      return `<div class="mini has-help" tabindex="0" data-kpi="${key}" data-title="${escapeHtml(label)}" data-description="${escapeHtml(description)}" data-detail="${escapeHtml(detail)}"><span>${label}</span><strong>${value}</strong></div>`;
+      const classes = ["mini", "has-help", extraClass].filter(Boolean).join(" ");
+      return `<div class="${classes}" tabindex="0" data-kpi="${key}" data-title="${escapeHtml(label)}" data-description="${escapeHtml(description)}" data-detail="${escapeHtml(detail)}"><span>${label}</span><strong>${value}</strong></div>`;
     }
 
     function sessionTitleMarkup(title) {
@@ -4491,6 +4628,28 @@ HTML_TEMPLATE = r"""<!doctype html>
       const costDetail = costBreakdownText(costParts);
       const agentsSpawned = agentsSpawnedForContext(context);
       const label = scopeLabel(context.scope);
+      const summaryCards = [
+        ["total", "Total Tokens", compact(usage.total)],
+        ["input", "Real Input Tokens", compact(uncachedInput(usage)), inputBreakdownText(usage)],
+        ["cachedInput", "Cached Input Tokens", compact(usage.cachedInput), inputBreakdownText(usage)],
+        ["output", "Output Tokens", compact(usage.output)],
+        ["cost", "Total Cost", money(cost), costDetail],
+        ["inputCost", "Real Input Cost", money(costParts.inputCost), costDetail],
+        ["cachedInputCost", "Cached Input Cost", money(costParts.cachedInputCost), costDetail],
+        ["outputCost", "Output Cost", money(costParts.outputCost), costDetail],
+        ["sessions", "Sessions", number(rows.length)],
+        ["messages", "Total Messages", number(messageEvents.total), messageBreakdownText(messageEvents)],
+        ["userWords", "User Words", number(userText.words || 0), userTextBreakdownText(userText)],
+        ["avgUserWords", "Avg Words / Message", avgUserWords.toFixed(1), userTextBreakdownText(userText)],
+        ["totalInput", "Total Input Tokens", compact(usage.input), inputBreakdownText(usage)],
+        ["cacheShare", "Cache Share", precisePct(usage.input ? usage.cachedInput / usage.input * 100 : 0), inputBreakdownText(usage)],
+        ["outputShare", "Output Share", precisePct(usage.total ? usage.output / usage.total * 100 : 0)],
+        ["agentsSpawned", "Agents Spawned", number(agentsSpawned), agentsSpawnedText(agentsSpawned)],
+        ["events", "Events", number(bucket.events || 0)],
+        ["reasoning", "Reasoning Tokens", compact(usage.reasoningOutput)],
+      ];
+      const summaryClass = state.selectedSummaryExpanded ? "expanded" : "collapsed";
+      const hiddenMetricCount = Math.max(0, summaryCards.length - 3);
       document.getElementById("dayDetails").innerHTML = `
         <div class="day-title">
           <div>
@@ -4502,34 +4661,12 @@ HTML_TEMPLATE = r"""<!doctype html>
           <div class="input" title="Input share"></div>
           <div class="output" title="Output share"></div>
         </div>
-        <div class="summary-strip">
-          ${kpiCard("total", "Total Tokens", compact(usage.total))}
-          ${kpiCard("input", "Real Input Tokens", compact(uncachedInput(usage)), inputBreakdownText(usage))}
-          ${kpiCard("cachedInput", "Cached Input Tokens", compact(usage.cachedInput), inputBreakdownText(usage))}
-          ${kpiCard("output", "Output Tokens", compact(usage.output))}
+        <div class="selected-summary ${summaryClass}">
+          ${summaryCards.map((card, index) => kpiCard(card[0], card[1], card[2], card[3] || "", index >= 3 ? "summary-extra" : "")).join("")}
         </div>
-        <div class="summary-strip">
-          ${kpiCard("cost", "Total Cost", money(cost), costDetail)}
-          ${kpiCard("inputCost", "Real Input Cost", money(costParts.inputCost), costDetail)}
-          ${kpiCard("cachedInputCost", "Cached Input Cost", money(costParts.cachedInputCost), costDetail)}
-          ${kpiCard("outputCost", "Output Cost", money(costParts.outputCost), costDetail)}
-        </div>
-        <div class="summary-strip">
-          ${kpiCard("sessions", "Sessions", number(rows.length))}
-          ${kpiCard("messages", "Total Messages", number(messageEvents.total), messageBreakdownText(messageEvents))}
-          ${kpiCard("userWords", "User Words", number(userText.words || 0), userTextBreakdownText(userText))}
-          ${kpiCard("avgUserWords", "Avg Words / Message", avgUserWords.toFixed(1), userTextBreakdownText(userText))}
-        </div>
-        <div class="summary-strip">
-          ${kpiCard("totalInput", "Total Input Tokens", compact(usage.input), inputBreakdownText(usage))}
-          ${kpiCard("cacheShare", "Cache Share", precisePct(usage.input ? usage.cachedInput / usage.input * 100 : 0), inputBreakdownText(usage))}
-          ${kpiCard("outputShare", "Output Share", precisePct(usage.total ? usage.output / usage.total * 100 : 0))}
-          ${kpiCard("agentsSpawned", "Agents Spawned", number(agentsSpawned), agentsSpawnedText(agentsSpawned))}
-        </div>
-        <div class="summary-strip">
-          ${kpiCard("events", "Events", number(bucket.events || 0))}
-          ${kpiCard("reasoning", "Reasoning Tokens", compact(usage.reasoningOutput))}
-        </div>
+        <button type="button" class="selected-summary-toggle" id="selectedSummaryToggle">
+          ${state.selectedSummaryExpanded ? "Show fewer metrics" : `Show ${hiddenMetricCount} more metrics`}
+        </button>
       `;
       attachKpiTooltips();
     }
@@ -4592,6 +4729,16 @@ HTML_TEMPLATE = r"""<!doctype html>
       return parts.at(-1) || clean;
     }
 
+    function normalizeProjectKey(value) {
+      return projectNameFromPath(value)
+        .normalize("NFKD")
+        .replace(/[\u0300-\u036f]/g, "")
+        .replace(/[_-]+/g, " ")
+        .replace(/\s+/g, " ")
+        .trim()
+        .toLowerCase();
+    }
+
     function compactProjectPath(path) {
       const clean = String(path || "");
       if (!clean || clean === "No cwd captured") return "No cwd captured";
@@ -4601,11 +4748,14 @@ HTML_TEMPLATE = r"""<!doctype html>
     function aggregateProjects() {
       const projects = new Map();
       for (const session of DATA.sessions || []) {
-        const key = session.cwd || "No cwd captured";
+        const rawPath = session.cwd || "No cwd captured";
+        const displayName = projectNameFromPath(rawPath);
+        const key = normalizeProjectKey(displayName) || displayName;
         if (!projects.has(key)) {
           projects.set(key, {
-            cwd: key,
-            name: projectNameFromPath(key),
+            cwd: rawPath,
+            name: displayName,
+            paths: new Set(),
             usage: usageZero(),
             byModel: {},
             sessions: 0,
@@ -4616,11 +4766,21 @@ HTML_TEMPLATE = r"""<!doctype html>
         const target = projects.get(key);
         addUsage(target.usage, session.usage || usageZero());
         addByModelUsage(target.byModel, session.byModel || {});
+        target.paths.add(compactProjectPath(rawPath));
         target.sessions += 1;
         target.events += session.events || 0;
-        if (session.lastSeen && (!target.lastSeen || session.lastSeen > target.lastSeen)) target.lastSeen = session.lastSeen;
+        if (session.lastSeen && (!target.lastSeen || session.lastSeen > target.lastSeen)) {
+          target.lastSeen = session.lastSeen;
+          target.cwd = rawPath;
+          target.name = displayName;
+        }
       }
-      return Array.from(projects.values()).sort((a, b) => (b.usage.total || 0) - (a.usage.total || 0));
+      return Array.from(projects.values())
+        .map(project => ({
+          ...project,
+          pathLabel: project.paths.size > 1 ? `${project.paths.size} paths` : compactProjectPath(project.cwd),
+        }))
+        .sort((a, b) => (b.usage.total || 0) - (a.usage.total || 0));
     }
 
     function renderTopSessions() {
@@ -4669,10 +4829,10 @@ HTML_TEMPLATE = r"""<!doctype html>
         const cost = costForByModel(item.byModel, item.usage);
         const sessionWord = item.sessions === 1 ? "session" : "sessions";
         return `
-          <article class="project-bar-row" title="${escapeHtml(compactProjectPath(item.cwd))}">
+          <article class="project-bar-row" title="${escapeHtml(Array.from(item.paths || []).join(" | ") || compactProjectPath(item.cwd))}">
             <div>
               <div class="project-name">${index + 1}. ${escapeHtml(item.name)}</div>
-              <div class="project-path">${escapeHtml(compactProjectPath(item.cwd))}</div>
+              <div class="project-path">${escapeHtml(item.pathLabel)}</div>
             </div>
             <div class="project-track" aria-label="${escapeHtml(item.name)} Total Tokens">
               <div class="project-fill" style="width:${share}%"></div>
@@ -4796,7 +4956,7 @@ HTML_TEMPLATE = r"""<!doctype html>
     function renderFooter() {
       const sources = DATA.meta.priceSources.map(source => `<a href="${source.url}">${escapeHtml(source.label)}</a>`).join(" · ");
       document.getElementById("footer").innerHTML = `
-        Generated ${new Date(DATA.meta.generatedAt).toLocaleString()} from <code>${escapeHtml(DATA.meta.codexHome)}</code>.
+        Generated ${new Date(DATA.meta.generatedAt).toLocaleString()} with Codex Analytics Dashboard ${escapeHtml(DATA.meta.appVersion || "unknown")} from <code>${escapeHtml(DATA.meta.codexHome)}</code>.
         Total Tokens are Real Input Tokens plus Cached Input Tokens plus Output Tokens. Reasoning Tokens are included in Output Tokens.
         "Total: detected model mix" means each model row is priced with that model's API rate, then summed. Model attribution comes from Codex turn/session metadata; token_count events do not carry a model field directly.
         Messages are reconstructed from user_message and agent_message log events; sessions in the range summary are unique thread IDs active in the selected range.
@@ -4871,6 +5031,13 @@ HTML_TEMPLATE = r"""<!doctype html>
       renderAll();
     });
     document.addEventListener("click", event => {
+      const selectedSummaryToggle = event.target.closest("#selectedSummaryToggle");
+      if (selectedSummaryToggle) {
+        state.selectedSummaryExpanded = !state.selectedSummaryExpanded;
+        renderDayDetails();
+        requestAnimationFrame(syncDetailsHeight);
+        return;
+      }
       const button = event.target.closest(".session-title-toggle");
       if (!button) return;
       toggleSessionTitle(button);

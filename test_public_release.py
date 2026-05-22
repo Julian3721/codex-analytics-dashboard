@@ -169,13 +169,37 @@ class PublicReleaseTests(unittest.TestCase):
             },
         }
 
-        dashboard.apply_project_aliases(payload, {dashboard.alias_key("New project"): "Thesis-DSDE"})
+        dashboard.apply_project_aliases(payload, {dashboard.alias_key("New project"): "Current Project"})
 
-        self.assertEqual(payload["sessions"][0]["cwd"], "Thesis-DSDE")
-        self.assertEqual(payload["sessions"][1]["cwd"], "Thesis-DSDE")
+        self.assertEqual(payload["sessions"][0]["cwd"], "Current Project")
+        self.assertEqual(payload["sessions"][1]["cwd"], "Current Project")
         self.assertEqual(payload["sessions"][2]["cwd"], "Other project")
-        self.assertEqual(payload["dailySessions"]["2026-05-22"][0]["cwd"], "Thesis-DSDE")
-        self.assertEqual(payload["devicePayloads"]["device-a"]["sessions"][0]["cwd"], "Thesis-DSDE")
+        self.assertEqual(payload["dailySessions"]["2026-05-22"][0]["cwd"], "Current Project")
+        self.assertEqual(payload["devicePayloads"]["device-a"]["sessions"][0]["cwd"], "Current Project")
+
+    def test_project_alias_file_is_created_and_loaded(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            with patch.dict(os.environ, {"CODEX_USAGE_DASHBOARD_DIR": tmpdir}, clear=True):
+                path = dashboard.ensure_project_aliases_file()
+                self.assertTrue(path.exists())
+                path.write_text(
+                    json.dumps(
+                        {
+                            "version": 1,
+                            "projects": [
+                                {
+                                    "name": "Current Project",
+                                    "aliases": ["Old Project", r"X:\Work\Old Project"],
+                                }
+                            ],
+                        }
+                    ),
+                    encoding="utf-8",
+                )
+
+                aliases = dashboard.file_project_aliases()
+
+        self.assertEqual(aliases[dashboard.alias_key("Old Project")], "Current Project")
 
     def test_user_text_word_count_handles_basic_multilingual_messages(self) -> None:
         self.assertEqual(dashboard.count_user_words("Hallo Welt, schreibe 10 Fragen."), 5)
@@ -332,6 +356,12 @@ class PublicReleaseTests(unittest.TestCase):
         self.assertIn("HEATMAP_SCALE_STEPS", dashboard.HTML_TEMPLATE)
         self.assertIn("progress-fill", dashboard.HTML_TEMPLATE)
         self.assertIn("% of top session, split", dashboard.HTML_TEMPLATE)
+
+    def test_dashboard_template_has_project_identity_and_compact_selected_summary(self) -> None:
+        self.assertIn("normalizeProjectKey", dashboard.HTML_TEMPLATE)
+        self.assertIn("selected-summary", dashboard.HTML_TEMPLATE)
+        self.assertIn("selectedSummaryToggle", dashboard.HTML_TEMPLATE)
+        self.assertIn("Generated ${new Date(DATA.meta.generatedAt).toLocaleString()} with Codex Analytics Dashboard", dashboard.HTML_TEMPLATE)
 
     def test_npm_package_uses_analytics_dashboard_name(self) -> None:
         package = json.loads((PACKAGE_ROOT / "package.json").read_text(encoding="utf-8"))

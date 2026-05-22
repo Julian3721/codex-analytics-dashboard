@@ -117,13 +117,40 @@ The dashboard defaults to **All devices** and includes a device selector in the 
 
 ## Project Aliases
 
-Codex stores the working directory name that was active when a session ran. If you rename a folder later, old sessions can still appear under the historical project name. You can add a local display alias without editing Codex logs or synced snapshots:
+Codex stores the working directory name that was active when a session ran. If you rename a folder later, old sessions can still appear under the historical project name.
+
+The dashboard automatically groups projects with the same final folder name across devices and paths. Case, hyphens, underscores, and extra spaces are ignored, so `My Project`, `my-project`, and `my_project` are treated as the same project.
+
+For true renames, use project aliases. The dashboard automatically creates a user-local `project_aliases.json` file next to its config:
+
+- macOS: `~/Library/Application Support/Codex Analytics Dashboard/project_aliases.json`
+- Linux: `${XDG_STATE_HOME:-~/.local/state}/codex-analytics-dashboard/project_aliases.json`
+- Windows: `%LOCALAPPDATA%/Codex Analytics Dashboard/project_aliases.json`
+
+You can add aliases from the command line:
 
 ```bash
 npx codex-analytics-dashboard@latest -- --project-alias "Old project name=New project name"
 ```
 
-Aliases are saved in the user-local app config and are applied when the dashboard aggregates sessions and snapshots. For example, `--project-alias "New project=Thesis-DSDE"` groups historical `New project` sessions under `Thesis-DSDE` in the dashboard output only.
+Or edit `project_aliases.json` directly:
+
+```json
+{
+  "version": 1,
+  "projects": [
+    {
+      "name": "Current Project Name",
+      "aliases": [
+        "Old Project Name",
+        "C:/old/path/Old Project Name"
+      ]
+    }
+  ]
+}
+```
+
+Aliases are applied when the dashboard aggregates sessions and snapshots. They only affect dashboard output; Codex logs, source folders, and synced snapshots are not rewritten.
 
 ## Outputs
 
